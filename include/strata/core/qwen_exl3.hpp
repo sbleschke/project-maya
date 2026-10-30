@@ -1,8 +1,9 @@
 // include/strata/core/qwen_exl3.hpp - an EXL3 pack of Qwen3.8-Flash-Next (tools/qwen/pack.py) on the `maya` engine's Qwen
 // path: its matrices on the device as the weight table's native rows (exl3::kTypeEXL3), its routed experts on the CPU.
 //
-// The experts are read from the model's files for every token and computed by the CPU lane's kernels, one worker a
-// routed expert: the plain path that shows the model's numbers are right, before any expert cache or GPU expert.
+// load_experts puts the most-routed experts that fit in VRAM; layer_hits computes those on the device, inside the token
+// graph, and adds them to the shared expert's output, so the combine that follows needs no change.  Any other expert is
+// read from the model's files for every token and computed by the CPU lane's kernels, one worker a routed expert.
 #pragma once
 
 #include "strata/core/exl3_table.hpp"
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -34,7 +36,17 @@ public:
     const void* mat(const std::string& name) const;
     size_t mat_count() const { return mats_.size(); }
     uint64_t vram_bytes() const { return vram_; }
-    /// `out` [k][n_embd]: routed experts `ids` of `layer` over x (n_embd floats), unweighted, as the pool's parts.
+    /// The experts of `profile` (ranked pairs; then every other expert, layer by layer) into `budget` bytes of VRAM.
+    bool load_experts(const std::vector<std::pair<int32_t, int32_t>>& profile, uint64_t budget, int k, std::string& err);
+    int64_t resident() const { return resident_; }
+    int64_t experts() const { return (int64_t) table_.layers.size() * n_expert_; }
+    uint64_t expert_vram_bytes() const { return expert_vram_; }
+    /// (a token graph's layer) shared += sum of weights[i] * expert ids[i] over x, for the experts in VRAM.  ids, weights,
+    /// x and shared are device buffers; k experts.
+    bool layer_hits(int layer, const int32_t* ids, const float* weights, const float* x, float* shared, void* stream,
+                    std::string& err) const;
+    /// `out` [k][n_embd]: routed experts `ids` of `layer` over x (n_embd floats), unweighted, as the pool's parts - zeros
+    /// for an expert in VRAM (layer_hits has counted it).
     void experts_run(int layer, const float* x, const int32_t* ids, int64_t n_embd, int64_t k, float* out);
 
 private:
@@ -48,6 +60,13 @@ private:
     uint64_t vram_ = 0;
     std::vector<std::vector<std::ifstream>> files_;   // [worker][file]
     std::vector<std::vector<uint8_t>> blobs_;         // [worker]
+    int n_expert_ = 0, k_ = 0;
+    int64_t resident_ = 0;
+    uint64_t expert_vram_ = 0;
+    std::vector<unsigned long long> host_table_;      // [layer * n_expert + expert]: the blob in VRAM, 0: not there
+    unsigned long long* d_table_ = nullptr;
+    unsigned long long* d_plan_ = nullptr;            // [k]
+    std::vector<strata::kernels::exl3::ExpertLayout> lay_;   // [layer]
 };
 
 }  // namespace strata::core

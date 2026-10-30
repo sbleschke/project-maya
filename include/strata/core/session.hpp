@@ -398,7 +398,8 @@ struct TokenHits {
     float* x_scale = nullptr;            ///< and its fp32 scales (the CPU pool's contract)
     void* scratch = nullptr;             ///< moe_hit_grouped_scratch_bytes(k, ...)
     float* hit_out = nullptr;            ///< device, k * n_embd
-    bool on() const { return d_res && cache_base && d_slot && d_dst && d_count && x_q8 && x_scale && scratch && hit_out; }
+    const class QwenExl3* x3 = nullptr;  ///< an EXL3 pack: its experts in VRAM instead of everything above
+    bool on() const { return x3 || (d_res && cache_base && d_slot && d_dst && d_count && x_q8 && x_scale && scratch && hit_out); }
 };
 
 bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, SessionState& s, float* parts_dev,
