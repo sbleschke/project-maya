@@ -25,11 +25,13 @@
 
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/exl3.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -1442,10 +1444,11 @@ bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+           ggml_type == 21 || ggml_type == 22 || ggml_type == 29 || ggml_type == exl3::kTypeEXL3;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
+    if (ggml_type == exl3::kTypeEXL3) return 0;   // (its Mat holds its pieces: no block layout to size)
     int block_elems, block_bytes;
     switch (ggml_type) {
     case 2: block_elems = 32; block_bytes = 18; break;
@@ -1486,6 +1489,20 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 16: case 17: case 18: case 19: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case exl3::kTypeEXL3: {
+        const size_t x_cs = (size_t) (n_in / 32) * sizeof(Q81Block);
+        for (int c = 0; c < ncols; c += exl3::kMaxMvCols) {
+            exl3::MvJob j;
+            j.m = (const exl3::Mat*) weights;
+            j.xq = (const uint8_t*) x_q8_1 + (size_t) c * x_cs;
+            j.y = y + (size_t) c * n_out;
+            j.ncol = std::min(ncols - c, exl3::kMaxMvCols);
+            j.xq_cs = x_cs;
+            j.y_cs = (size_t) n_out * sizeof(float);
+            if (!exl3::mv(&j, 1, (cudaStream_t) stream)) throw std::runtime_error("EXL3 MMVQ launch failed");
+        }
+        break;
+    }
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
 }

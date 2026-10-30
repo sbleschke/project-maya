@@ -5,6 +5,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -22,6 +23,12 @@
 #define STRATA_SPIN_PAUSE() strata_cpu_pause()
 
 namespace strata::core {
+
+// An EXL3 pack's kernels keep a scratch per stream, which they cannot allocate inside a capture.
+static void exl3_prepare_stream(const WeightTable& tables, cudaStream_t cs) {
+    const WeightRef* w = tables.find("output.weight");
+    if (w != nullptr && w->native_type == strata::kernels::exl3::kTypeEXL3) strata::kernels::exl3::prepare(cs);
+}
 namespace {
 
 constexpr uint64_t SESSION_STATE_ALIGN = 256;
@@ -188,7 +195,8 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                 err = std::string("session_capture: stream create failed");
                 return false;
             }
-            if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            exl3_prepare_stream(tables, cs);
+    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
                 err = "session_capture: begin failed at layer " + std::to_string(l);
                 return false;
             }
@@ -809,6 +817,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
     }
     cudaStream_t cs = nullptr;
     if (cudaStreamCreate(&cs) != cudaSuccess) { err = "session_capture_token: stream create failed"; return false; }
+    exl3_prepare_stream(tables, cs);
     if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         cudaStreamDestroy(cs);
         err = "session_capture_token: begin capture failed";

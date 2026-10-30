@@ -13,6 +13,12 @@ namespace {
 
 constexpr int THREADS = 256;
 
+__global__ void bf16_embed_rows_kernel(const uint16_t* __restrict__ table, const int32_t* __restrict__ tokens, float* __restrict__ out,
+                                       long long n_embd) {
+    const long long i = (long long) blockIdx.y * n_embd + (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = f32_from_bf16(table[(long long) tokens[blockIdx.y] * n_embd + (long long) blockIdx.x * blockDim.x + threadIdx.x]);
+}
+
 /// One thread per output row, walking it contiguously.  Kept as the naive reference the split version is
 /// checked against, and used directly for the shapes where the output width is already large.
 __global__ void bf16_gemv_naive_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
@@ -80,6 +86,22 @@ inline void finish(void* stream, const char* what) {
 }
 
 }  // namespace
+
+void bf16_embed_rows(const void* table, const int32_t* tokens, int64_t n_tok, int64_t n_embd, float* out, void* stream) {
+    if (n_embd % THREADS != 0) { std::fprintf(stderr, "bf16_embed_rows: bad arguments\n"); std::exit(1); }
+    bf16_embed_rows_kernel<<<dim3((unsigned) (n_embd / THREADS), (unsigned) n_tok), THREADS, 0, (cudaStream_t) stream>>>(
+        (const uint16_t*) table, tokens, out, n_embd);
+}
+
+void bf16_row_f32(const void* src, int64_t n, float* out, void* stream) {
+    if (n % THREADS != 0) { std::fprintf(stderr, "bf16_row_f32: bad arguments\n"); std::exit(1); }
+    static const int32_t* zero = [] {
+        int32_t* z = nullptr;
+        if (cudaMalloc(&z, sizeof(int32_t)) != cudaSuccess || cudaMemset(z, 0, sizeof(int32_t)) != cudaSuccess) std::exit(1);
+        return z;
+    }();
+    bf16_embed_rows(src, zero, 1, n, out, stream);
+}
 
 void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
     if (n_in <= 0 || n_out <= 0) return;

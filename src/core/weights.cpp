@@ -138,11 +138,12 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         IndexRow r;
         char name[256] = {0};
         int kind = 0;
+        char kind_text[16] = {0};
         // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
         // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
         const int n = std::sscanf(line,
-                                  "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
-                                  name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
+                                  "%255s %d %15s %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+                                  name, &r.file, kind_text, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
                                   &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
                                   &r.scales_fp16, &r.act_kind);
@@ -154,6 +155,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             return false;
         }
         r.name = name;
+        // an EXL3 pack's matrix (exl3.txt holds it; the caller skips the row, QwenExl3 serves it): no bytes here
+        kind = kind_text[0] == 'x' ? (int) WeightKind::Verbatim : std::atoi(kind_text);
         // plan v0.3 P6: a standalone native pack (tools/iq_pack.py) stores 16-bit floats as they are in the GGUF:
         // index kinds 4 (BF16) and 5 (F16) are copied and take the engine forms of kinds 1 and 3
         if (kind == 4 || kind == 5) {
