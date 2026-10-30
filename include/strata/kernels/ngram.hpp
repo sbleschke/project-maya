@@ -45,6 +45,9 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 // 5 blocks of 32 at 18 bytes = 90 bytes.  The head-slowest flatten then makes 16 rows exactly n_embd = 2560.
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90
+// An EXL3 table's row at K bits a value: a fp16 scale and the ring, 2 + 20 K bytes (ngram_trellis_dequant_row).
+inline constexpr int PLE_TRELLIS_MAX_K = 8;
+inline constexpr int PLE_MAX_ROW_BYTES = 2 + PLE_HEAD_DIM * PLE_TRELLIS_MAX_K / 8;   // 162
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///
@@ -96,6 +99,16 @@ int iq4nl_code(int code);
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 
+/// One row of an EXL3 table (exllamav3's exl3_ngram_trellis, its ngram_codec.py and ngram_dequant) -> 160 floats.
+///
+///   row      little-endian uint16: word 0 the row's fp16 scale, then the 160 K-bit ring: stream bits [i K, (i + 1) K)
+///            are the low K bits of element i's 16-bit trellis state, whose higher bits are the symbols of the
+///            elements before it (tail-biting, mod 160)
+///   value    fp16(decode_mul1(state_i)) * scale + bias160[i], the sum rounded to fp16, as exllamav3's kernel rounds it
+///
+/// `bias160` is the row's HEAD's bias vector.  K 1..8.
+void ngram_trellis_dequant_row(const uint8_t* row, int K, const float* bias160, float* out160);
+
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
 /// A/B arm; it returns the same bytes.
@@ -110,6 +123,9 @@ struct PleIoOptions {
     uint32_t max_inflight = 64;      ///< outstanding SSD reads (decode needs 16; prefill chunks use more)
     uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
+    /// An EXL3 table with other hash constants than the artifact's (a test's small table).  The engine never sets
+    /// this: `ngram_rows` hashes with `ple_artifact_consts`, so another table would read valid, wrong rows.
+    bool any_hash = false;
 };
 
 /// The PLE table.  Held by pointer-to-impl so this header does not drag `<windows.h>` into every
@@ -122,6 +138,7 @@ public:
     PleTable& operator=(const PleTable&) = delete;
 
     /// Open with an explicit I/O mode. The two-argument `open` below is the default (Direct).
+    /// `gguf_path` may instead name a pack's `ngram.txt` (tools/qwen/pack.py): an EXL3 table, Direct mode only.
     bool open(const std::string& gguf_path, std::string& err, const PleIoOptions& io);
 
     /// The split the plan asks for: `issue` as soon as the token id is known, `collect` just before layer 1
@@ -162,6 +179,7 @@ public:
     PleIo mode() const;
 
 private:
+    bool open_trellis(const std::string& txt_path, std::string& err, const PleIoOptions& io);
     struct Impl;
     Impl* impl_ = nullptr;
 };
