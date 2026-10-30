@@ -20,6 +20,7 @@
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
@@ -42,6 +43,8 @@ public:
 
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
+    /// How the trunk's streams are normed on the way in (see record_forward): per stream for an EXL3 pack's drafter.
+    bool per_stream_norm() const { return x3_table_ != nullptr; }
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
@@ -134,6 +137,10 @@ private:
     uint64_t experts_bytes_ = 0;
     bool want_lend_ = false;
     LendableArena experts_arena_;   ///< `experts_` when lendable (not ok: one cudaMalloc)
+    // an EXL3 pack's drafter (experts_exl3.bin): experts_ holds its blobs, run by the EXL3 kernels
+    unsigned long long* x3_table_ = nullptr;   // [n_expert]: the blobs
+    unsigned long long* x3_plan_ = nullptr;    // [k]
+    strata::kernels::exl3::ExpertLayout x3_lay_;
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;

@@ -1,4 +1,5 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
+#include "strata/kernels/exl3.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/on_device.hpp"
 
@@ -109,6 +110,8 @@ MtpDrafter::~MtpDrafter() {
     if (dense_) cudaFree(dense_);
     if (experts_ && !experts_arena_.ok()) cudaFree(experts_);
     experts_arena_.close();
+    if (x3_table_) cudaFree(x3_table_);
+    if (x3_plan_) cudaFree(x3_plan_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
@@ -208,8 +211,51 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         vram_ += blob.size();
     }
-    // ---- the 512 routed experts, one blob each
-    {
+    // ---- the 512 routed experts, one blob each: an EXL3 pack's as they are in the model's files
+    std::ifstream x3_txt(rt_dir + "/experts_exl3.txt");
+    uint64_t x3_gu = 0, x3_dn = 0;
+    if (x3_txt) {
+        x3_txt >> x3_lay_.k2[0] >> x3_lay_.k2[1] >> x3_lay_.k2[2] >> x3_gu >> x3_dn;
+        if (!x3_txt) { err = "mtp: malformed experts_exl3.txt"; return false; }
+    }
+    if (x3_gu != 0) {
+        size_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const size_t k = r < 2 ? (size_t) g.n_embd : (size_t) g.n_ff, n = r < 2 ? (size_t) g.n_ff : (size_t) g.n_embd;
+            x3_lay_.trellis[r] = at;
+            at += k * n * x3_lay_.k2[r] / 16;
+            x3_lay_.suh[r] = at;
+            at += 2 * k;
+            x3_lay_.svh[r] = at;
+            at += 2 * n;
+        }
+        x3_lay_.cb = 2;
+        const uint64_t blob = 2 * x3_gu + x3_dn, bytes = (uint64_t) g.n_expert * blob;
+        if ((uint64_t) at != blob) { err = "mtp: experts_exl3.txt's sizes do not fit its bitrates"; return false; }
+        FILE* f = std::fopen((rt_dir + "/experts_exl3.bin").c_str(), "rb");
+        if (f == nullptr) { err = "mtp: cannot open experts_exl3.bin"; return false; }
+        struct Closer {
+            FILE* f;
+            ~Closer() { if (f != nullptr) std::fclose(f); }
+        } closer{f};
+        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        std::vector<uint8_t> chunk(64u << 20);
+        for (uint64_t off = 0; off < bytes;) {
+            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
+            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts_exl3.bin is truncated"; return false; }
+            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+            off += n;
+        }
+        std::vector<unsigned long long> table((size_t) g.n_expert);
+        for (int64_t e = 0; e < g.n_expert; ++e) table[(size_t) e] = (unsigned long long) (experts_ + (uint64_t) e * blob);
+        if (cudaMalloc((void**) &x3_table_, table.size() * sizeof(unsigned long long)) != cudaSuccess ||
+            cudaMemcpy(x3_table_, table.data(), table.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMalloc((void**) &x3_plan_, (size_t) ss.k * sizeof(unsigned long long)) != cudaSuccess) {
+            err = "mtp: the experts' table does not fit";
+            return false;
+        }
+        vram_ += bytes;
+    } else {
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
@@ -352,6 +398,12 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     if (!wo) { err = "mtp: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
+    const bool x3_head = head->type() == strata::kernels::exl3::kTypeEXL3;
+    if (x3_head || x3_table_ != nullptr) strata::kernels::exl3::prepare(cs_);   // (its kernels' scratch: not inside a capture)
+    if (x3_table_ != nullptr && cudaMemset(parts_, 0, (size_t) max_t_ * ss_->k * g_->n_embd * sizeof(float)) != cudaSuccess) {
+        err = "mtp: cannot clear the experts' parts";
+        return false;
+    }
     if (head_logits_ == nullptr &&
         cudaMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != cudaSuccess) {
         err = "mtp: the draft logits do not fit";
@@ -361,6 +413,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     if (dhead_ == nullptr) {
         std::vector<uint8_t> raw;
         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
+            if (x3_head) { err = "mtp: draft_vocab.bin needs a head with rows, and an EXL3 head has tiles"; return false; }
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
@@ -409,7 +462,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
         native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
-        native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
+        // An EXL3 pack: each of the four streams by its own RMS, as exllamav3's Qwen4ExpMTPInputLayer (over all of them as
+        // one vector its drafts were accepted 6-23% of the time, 78-92% so).  A GGUF's drafter keeps the one vector: on
+        // CYBER-FROST-3.8-PS, the one model measured, it does better that way (62% against 52% over 200 tokens).
+        if (per_stream_norm()) native_qsa_rms_norm_streams(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, T, EPS, cs);
+        else native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
         for (int c0 = 0; c0 < T * HC; c0 += 8) {
             const int nc = (int) std::min<int64_t>(8, T * HC - c0);
             native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
@@ -488,17 +545,20 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         }
-        // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write
+        // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write (an EXL3 pack's experts
+        // add to the shared expert's output below; parts_ stays zeros)
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
             if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
-        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
-                           grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
-        quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
-        moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
-                       hit_xs_, hit_scratch_, parts_, cs);
+        if (x3_table_ == nullptr) {
+            moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+                               grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
+            quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
+            moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
+                           hit_xs_, hit_scratch_, parts_, cs);
+        }
         NativeSharedWeights nsw;
         nsw.gate_type = GGML_Q8_0; nsw.gate_data = q8("mlp.shared_expert.gate_proj.weight");
         nsw.up_type = GGML_Q8_0; nsw.up_data = q8("mlp.shared_expert.up_proj.weight");
@@ -510,6 +570,21 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             shared_expert(nullptr, nullptr, x_bf16_, none, nullptr, nullptr, nullptr, none, nullptr, nullptr, nullptr, none,
                           nullptr, nullptr, nullptr, bf16("mlp.shared_expert_gate.weight"), sh_scratch_, shared_ + t * N,
                           N, g.n_ff, 32, cs, mixed_ + t * N, &nsw);
+            if (x3_table_ != nullptr) {
+                namespace x3 = strata::kernels::exl3;
+                x3::plan_from_table(ids_ + t * K, x3_table_, (int) K, x3_plan_, cs);
+                for (int c = 0; c < (int) K; c += 8) {   // (the kernels take 8 experts a launch)
+                    x3::MoeArgs a;
+                    a.plan_ptr = x3_plan_ + c;
+                    a.plan_w = w_ + t * K + c;
+                    a.lay = x3_lay_;
+                    a.k = std::min((int) K - c, 8);
+                    a.n_embd = (int) N;
+                    a.n_ff = (int) g.n_ff;
+                    x3::moe_gate_up(a, mixed_ + t * N, nullptr, cs);
+                    x3::moe_down(a, nullptr, shared_ + t * N, shared_ + t * N, cs);
+                }
+            }
             if (native_moe_combine_enabled())
                 native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
             else

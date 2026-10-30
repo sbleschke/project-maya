@@ -22,8 +22,11 @@ pack/ngram.txt names the n-gram table for PleTable (--ple-gguf <pack>/ngram.txt)
 checked to be one run of rows in row order.  The file may be swapped for another quant's (turboderp's card says so):
 pack again afterwards.
 
-The NextN (MTP) block stays out of this pack, as iq_pack.py leaves a GGUF's out: block_count here is the trunk's 48.
-The vision tower is not packed (the Qwen path is text only).
+The NextN (MTP) block stays out of the index, as iq_pack.py leaves a GGUF's out: block_count here is the trunk's 48.
+pack/mtp/ is the drafter built from it (--mtp <pack>/mtp), dense.txt / dense.bin as tools/mtp_from_gguf.py writes them
+(its matrices in Q8_0) but its experts as they are: experts_exl3.bin, [gate | up | down], a part [trellis | suh | svh],
+with their bitrates in experts_exl3.txt, run by the trunk's EXL3 kernels: no decode and no second quantization.  All its
+norms take the + 1, its two input norms too.  The vision tower is not packed (the Qwen path is text only).
 """
 from __future__ import annotations
 
@@ -359,6 +362,73 @@ def write_ngram_txt(table: dict, d: pathlib.Path, out: pathlib.Path) -> None:
                                                                  table["rows"] * table["row_bytes"] / 1e9))
 
 
+# ------------------------------------------------------------------ the MTP drafter
+def write_mtp(plan: QwenPlan, out: pathlib.Path) -> None:
+    from mtp_from_gguf import bf16
+    from mtp_rt import q8_0
+    st, t = plan.st, plan.cfg
+    H, FF, NE = t["hidden_size"], t["moe_intermediate_size"], t["num_experts"]
+    M, A, S = "mtp.", "mtp.layers.0.self_attn.", "mtp.layers.0.mlp."
+    if not st.has(M + "fc_embedding.trellis"):
+        print("note: the files carry no MTP block - no drafter")
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    lay = plan._experts(-1, S, NE)
+    if lay["cb"] != 2 or lay["k2"][0] != lay["k2"][1]:
+        raise SystemExit("the MTP experts are not of the mul1 codebook, or their gate and up differ")
+    with X.replace_atomic(out / "experts_exl3.bin") as f:
+        for e in range(NE):
+            for r in X.ROLES:
+                E = S + "experts.%d.%s_proj." % (e, r)
+                for x in ("trellis", "suh", "svh"):
+                    f.write(st.raw(E + x).tobytes())
+    with X.replace_atomic(out / "experts_exl3.txt") as f:
+        f.write(("%d %d %d %d %d\n" % (*lay["k2"], lay["gu_bytes"], lay["dn_bytes"])).encode())
+    g, one = st.f32, lambda n: st.f32(n) + 1  # noqa: E731
+    dense = [
+        ("fc_embedding.weight", "q8_0", plan._decoded(M + "fc_embedding")),
+        ("fc_hidden.weight", "q8_0", plan._decoded(M + "fc_hidden")),
+        ("pre_fc_norm_embedding.weight", "f32", one(M + "pre_fc_norm_embedding.weight")),
+        ("pre_fc_norm_hidden.weight", "f32", one(M + "pre_fc_norm_hidden.weight")),
+        ("self_attn.q_proj.weight", "q8_0", plan._decoded(A + "q_proj")),
+        ("self_attn.k_proj.weight", "q8_0", plan._decoded(A + "k_proj")),
+        ("self_attn.v_proj.weight", "q8_0", plan._decoded(A + "v_proj")),
+        ("self_attn.o_proj.weight", "q8_0", plan._decoded(A + "o_proj")),
+        ("self_attn.q_norm.weight", "f32", one(A + "q_norm.weight")),
+        ("self_attn.k_norm.weight", "f32", one(A + "k_norm.weight")),
+    ]
+    for short, hf in (("attn_hyper_connection", "mtp.layers.0.attn_hyper_connection."),
+                      ("mlp_hyper_connection", "mtp.layers.0.mlp_hyper_connection.")):
+        dense += [(short + ".hc_norm.weight", "f32", one(hf + "hc_norm.weight")),
+                  (short + ".input_mix_weight_down.weight", "bf16", g(hf + "input_mix_weight_down.weight")),
+                  (short + ".input_mix_weight_up.weight", "bf16", g(hf + "input_mix_weight_up.weight")),
+                  (short + ".block_inject_weight.weight", "bf16", g(hf + "block_inject_weight.weight"))]
+    X_ = M + "hyper_connection_mixer."
+    dense += [("hyper_connection_mixer.hc_norm.weight", "f32", one(X_ + "hc_norm.weight")),
+              ("hyper_connection_mixer.input_mix_weight_down.weight", "bf16", g(X_ + "input_mix_weight_down.weight")),
+              ("hyper_connection_mixer.input_mix_weight_up.weight", "bf16", g(X_ + "input_mix_weight_up.weight")),
+              ("mlp.gate.weight", "bf16", g(S + "gate.weight")),
+              ("mlp.shared_expert.gate_proj.weight", "q8_0", plan._decoded(S + "shared_expert.gate_proj")),
+              ("mlp.shared_expert.up_proj.weight", "q8_0", plan._decoded(S + "shared_expert.up_proj")),
+              ("mlp.shared_expert.down_proj.weight", "q8_0", plan._decoded(S + "shared_expert.down_proj")),
+              ("mlp.shared_expert_gate.weight", "bf16", g(S + "shared_expert_gate.weight").reshape(1, -1))]
+    lines, off = [], 0
+    with X.replace_atomic(out / "dense.bin") as f:
+        for name, kind, a in dense:
+            a = np.asarray(a, dtype=np.float32)
+            rows, cols = (1, a.size) if a.ndim == 1 else (a.shape[0], int(np.prod(a.shape[1:])))
+            raw = q8_0(a.reshape(rows, cols)) if kind == "q8_0" else bf16(a) if kind == "bf16" else a.tobytes()
+            pad = (-off) % 256
+            f.write(b"\0" * pad)
+            off += pad
+            f.write(raw)
+            lines.append("%s %s %d %d %d %d" % (name, kind, rows, cols, off, len(raw)))
+            off += len(raw)
+    with X.replace_atomic(out / "dense.txt") as f:
+        f.write(("\n".join(lines) + "\n").encode())
+    print("mtp/: %d experts at K %s, %d tensors, dense.bin %.2f GB" % (NE, X.k_text(lay["k2"][0]), len(lines), off / 1e9))
+
+
 # ------------------------------------------------------------------ --check
 def check(plan: QwenPlan, st: X.SafeTensors, ref: pathlib.Path, layers: set, meta: list, tok: dict) -> int:
     """This pack against a GGUF of the model (a fine-tune's serves: its weights are close, not the same).  Reordered
@@ -498,6 +568,7 @@ def main() -> int:
             return rc
     X.write_all(plan, d, out, t, 0, None, meta=meta, tok=tok)
     write_ngram_txt(table, d, out)
+    write_mtp(plan, out / "mtp")
     for n in plan.notes:
         print("note: " + n)
     return 0

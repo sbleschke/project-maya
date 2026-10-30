@@ -605,12 +605,18 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
     }
 }
 
+constexpr int64_t n_embd_of_window = strata::kernels::NG_N_EMBD;   // (an EXL3 pack's: the verify pool has no n_embd)
+
 /// Plan v0.3 P6: the pool for a verify window.
 void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
+    if (t->exl3 != nullptr)
+        for (int64_t i = 0; i < n_tok; ++i)
+            t->exl3->experts_run((int) layer, x_f + i * n_embd_of_window, ids + i * k, n_embd_of_window, k, out + i * k * n_embd_of_window);
+    else
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
@@ -4862,11 +4868,11 @@ int main(int argc, char** argv) {
     strata::core::layer_set_shared_early(!o.shared_late);
     // An EXL3 pack of Qwen3.8-Flash-Next (tools/qwen/pack.py): its matrices as EXL3 on the GPU, its most-routed experts
     // in VRAM as far as they fit (--vram-reserve-mib leaves room; --expert-profile ranks them), the others on the CPU
-    // (QwenExl3).  So far: one GPU, no drafter.
+    // (QwenExl3).  So far: one GPU, the command line's one prompt (no --serve).
     const bool qwen_exl3 = o.glm_pack.empty() && std::filesystem::exists(std::filesystem::path(o.pack) / "exl3.txt");
-    if (qwen_exl3 && (!o.native_preset.empty() || o.spec > 0 || o.mtp_max_t > 0 || !o.mtp.empty() ||
+    if (qwen_exl3 && (!o.native_preset.empty() || o.serve ||
                       o.expert_cache != 0 || !o.layer_split.empty() || o.vision)) {
-        std::fprintf(stderr, "maya generate: %s is an EXL3 pack: it takes no --native, --spec, --mtp, "
+        std::fprintf(stderr, "maya generate: %s is an EXL3 pack: it takes no --native, --serve, "
                              "--expert-cache, --layer-split or --vision yet\n", o.pack.c_str());
         return 2;
     }
@@ -8779,7 +8785,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
-        if (thits.d_res == nullptr) {
+        if (thits.d_res == nullptr && !qwen_exl3) {
             std::fprintf(stderr, "maya generate: --spec needs the device residency table (--expert-profile, "
                                  "--expert-cache and the token graph)\n");
             return 2;
@@ -8792,6 +8798,7 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
+        if (qwen_exl3) vh.x3 = &qwen_x3;
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
@@ -8814,7 +8821,7 @@ int main(int argc, char** argv) {
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
         const int64_t pcie0 = drive.d.pcie_experts;
-        if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !qwen_exl3) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         cudaStream_t adapt_stream = nullptr;

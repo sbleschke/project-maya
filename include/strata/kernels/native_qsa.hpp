@@ -21,6 +21,11 @@ bool native_qsa_enabled();
 void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                   int n_cols, int n_rows, float epsilon, void* stream);
 
+// The same over a stack of streams: input/output [n_cols,n_streams,n_rows], gamma[n_cols,n_streams]; each stream of each
+// row has its own statistics and its own gamma (the MTP head's input: exllamav3's Qwen4ExpMTPInputLayer).
+void native_qsa_rms_norm_streams(const float* input, const float* gamma, float* output, int n_cols, int n_streams,
+                                 int n_rows, float epsilon, void* stream);
+
 // attn/output [head_dim,n_head]; q_full [2*head_dim,n_head], each row is
 // [query channels, gate channels]. Output is attn*sigmoid(second-half gate).
 // Exact output==attn is supported; all other spans must be disjoint.

@@ -1498,7 +1498,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
             j.y = y + (size_t) c * n_out;
             j.ncol = std::min(ncols - c, exl3::kMaxMvCols);
             j.xq_cs = x_cs;
-            j.y_cs = (size_t) n_out * sizeof(float);
+            j.y_cs = (size_t) n_out;   // (floats; xq_cs is bytes)
             if (!exl3::mv(&j, 1, (cudaStream_t) stream)) throw std::runtime_error("EXL3 MMVQ launch failed");
         }
         break;
