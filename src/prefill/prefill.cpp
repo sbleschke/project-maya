@@ -18,6 +18,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/core/qwen_exl3.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
@@ -250,6 +251,7 @@ struct Stager {
 };
 
 struct Prefill::Impl {
+    core::QwenExl3* x3 = nullptr;   // an EXL3 pack's experts
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -509,6 +511,8 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     return a.used;
 }
 }
+
+void Prefill::set_exl3(core::QwenExl3* x3) { impl_->x3 = x3; }
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
@@ -1614,6 +1618,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.off[0] = 0;
                     for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
                     std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                    // (an EXL3 pack: the rows in its order - the experts in VRAM first, in the order of their blobs)
+                    if (m.x3 != nullptr) m.x3->row_starts((int) l, m.cnt.data(), fill.data());
+                    const std::vector<int32_t> starts = m.x3 != nullptr ? fill : std::vector<int32_t>();
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = ids_h[(size_t) i];
                         const int32_t p = fill[(size_t) e]++;
@@ -1638,6 +1645,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                     const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                     pt.mark(kPfGather, cs);
+                    if (m.x3 != nullptr) {
+                        // (FP16 rows: the plain path's buffer, or in an MMQ build its float H, which holds them)
+                        uint16_t* h16 = m.Hh != nullptr ? m.Hh : reinterpret_cast<uint16_t*>(m.H);
+                        if (h16 == nullptr) { err = "prefill: this build's prompt buffers do not take an EXL3 pack"; return false; }
+                        pt.mark(kPfGemmGU, cs);
+                        if (!m.x3->prompt_experts((int) l, m.cnt.data(), starts.data(), m.mixed, m.src_dev, h16, m.Dm,
+                                                  stats_.experts_resident, stats_.experts_streamed, (void*) m.cs, err))
+                            return false;
+                    } else {
                     if (use_mmq) {
                         // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
                         // (the WMMA path keeps them FP16 - mixed_h read through src - and skips this)
@@ -1841,6 +1857,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                         }
                         release_to(m.g->n_expert);
+                    }
                     }
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);

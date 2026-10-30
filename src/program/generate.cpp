@@ -4862,11 +4862,11 @@ int main(int argc, char** argv) {
     strata::core::layer_set_shared_early(!o.shared_late);
     // An EXL3 pack of Qwen3.8-Flash-Next (tools/qwen/pack.py): its matrices as EXL3 on the GPU, its most-routed experts
     // in VRAM as far as they fit (--vram-reserve-mib leaves room; --expert-profile ranks them), the others on the CPU
-    // (QwenExl3).  So far: one GPU, token by token, no drafter.
+    // (QwenExl3).  So far: one GPU, no drafter.
     const bool qwen_exl3 = o.glm_pack.empty() && std::filesystem::exists(std::filesystem::path(o.pack) / "exl3.txt");
-    if (qwen_exl3 && (!o.native_preset.empty() || o.prefill_chunk > 0 || o.spec > 0 || o.mtp_max_t > 0 || !o.mtp.empty() ||
+    if (qwen_exl3 && (!o.native_preset.empty() || o.spec > 0 || o.mtp_max_t > 0 || !o.mtp.empty() ||
                       o.expert_cache != 0 || !o.layer_split.empty() || o.vision)) {
-        std::fprintf(stderr, "maya generate: %s is an EXL3 pack: it takes no --native, --prefill, --spec, --mtp, "
+        std::fprintf(stderr, "maya generate: %s is an EXL3 pack: it takes no --native, --spec, --mtp, "
                              "--expert-cache, --layer-split or --vision yet\n", o.pack.c_str());
         return 2;
     }
@@ -6656,7 +6656,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         // (the reserve, and about 1 GiB for the graph's scratch and the kernels' own)
-        const uint64_t keep = ((uint64_t) std::max(o.vram_reserve_mib, 0) << 20) + (1ull << 30);
+        // (... and, with --prefill, the prompt path's buffers)
+        const int64_t prompt_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const uint64_t keep = ((uint64_t) std::max(o.vram_reserve_mib, 0) << 20) + (1ull << 30) + ((uint64_t) prompt_mib << 20);
         const uint64_t budget = (uint64_t) free_b > keep ? (uint64_t) free_b - keep : 0;
         const auto t0 = std::chrono::steady_clock::now();
         if (!qwen_x3.load_experts(profile, budget, (int) K, err)) {
@@ -8454,6 +8456,7 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "maya generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
+        if (qwen_exl3) prefill.set_exl3(&qwen_x3);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {

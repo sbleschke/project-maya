@@ -43,6 +43,8 @@ QwenExl3::~QwenExl3() {
     if (scratch_) cudaFree(scratch_);
     if (d_table_) cudaFree(d_table_);
     if (d_plan_) cudaFree(d_plan_);
+    if (d_bounds_) cudaFree(d_bounds_);
+    if (d_stage_) cudaFree(d_stage_);
 }
 
 bool QwenExl3::served_names(const std::string& pack_dir, std::set<std::string>& out, std::string& err) {
@@ -134,6 +136,7 @@ const void* QwenExl3::mat(const std::string& name) const {
 }
 
 namespace {
+constexpr int kStage = 16;   // the prompt path's experts not in VRAM, a read and a launch at a time
 // One blob: [gate | up | down], a part [trellis | suh | svh], read from the model's files (each piece a multiple of 256
 // bytes, as the device kernels' layout wants).
 bool read_blob(const Exl3Table::Layer& L, int id, std::vector<std::ifstream>& files, uint8_t* at) {
@@ -190,6 +193,7 @@ bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& prof
         chosen[(size_t) l].push_back(e);
         return true;
     };
+    arena_.assign((size_t) n_layers, nullptr);
     bool room = true;
     for (const auto& p : profile)
         if (!(room = take(p.first, p.second))) break;
@@ -203,7 +207,8 @@ bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& prof
             r.emplace_back((std::filesystem::path(dir_) / name).string(), std::ios::binary);
     std::vector<uint8_t> host;
     for (int l = 0; l < n_layers; ++l) {
-        const std::vector<int>& es = chosen[(size_t) l];
+        std::vector<int>& es = chosen[(size_t) l];
+        std::sort(es.begin(), es.end());   // (ascending id: a prompt's rows run in this order)
         if (es.empty()) continue;
         const Exl3Table::Layer& L = table_.layers.at(l);
         const uint64_t blob = L.blob(), bytes = blob * es.size();
@@ -228,6 +233,7 @@ bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& prof
             return false;
         }
         device_.push_back(d);
+        arena_[(size_t) l] = (const uint8_t*) d;
         for (size_t i = 0; i < es.size(); ++i)
             host_table_[(size_t) l * n_expert_ + es[i]] = (unsigned long long) ((uint8_t*) d + i * blob);
         resident_ += (int64_t) es.size();
@@ -238,6 +244,118 @@ bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& prof
         cudaMalloc((void**) &d_plan_, (size_t) k * sizeof(unsigned long long)) != cudaSuccess) {
         err = "EXL3 pack: cannot allocate the experts' table on the GPU";
         return false;
+    }
+    slots_ = std::move(chosen);
+    for (const auto& kv : table_.layers) max_blob_ = std::max(max_blob_, kv.second.blob());
+    if (cudaMalloc((void**) &d_bounds_, (size_t) (n_expert_ + 1) * sizeof(int)) != cudaSuccess ||
+        cudaMalloc((void**) &d_stage_, (size_t) kStage * max_blob_) != cudaSuccess) {
+        err = "EXL3 pack: cannot allocate the prompt path's staging buffer on the GPU";
+        return false;
+    }
+    return true;
+}
+
+void QwenExl3::row_starts(int layer, const int32_t* cnt, int32_t* starts) const {
+    int32_t at = 0;
+    for (int e : slots_[(size_t) layer]) {
+        starts[e] = at;
+        at += cnt[e];
+    }
+    for (int e = 0; e < n_expert_; ++e)
+        if (host_table_[(size_t) layer * n_expert_ + e] == 0ull) {
+            starts[e] = at;
+            at += cnt[e];
+        }
+}
+
+bool QwenExl3::prompt_experts(int layer, const int32_t* cnt, const int32_t* starts, const float* x, const int32_t* row_tok,
+                              uint16_t* h16, float* y, int64_t& n_resident, int64_t& n_streamed, void* stream,
+                              std::string& err) {
+    namespace x3k = strata::kernels::exl3;
+    const cudaStream_t cs = (cudaStream_t) stream;
+    const Exl3Table::Layer& L = table_.layers.at(layer);
+    const int n_embd = L.k[0], n_ff = L.n[0];
+    const auto launch = [&](const uint8_t* wbase, size_t stride, int n_exp, int row0, int max_rows) {
+        x3k::SetArgs sa;
+        sa.wbase = wbase;
+        sa.stride = stride;
+        sa.lay = lay_[(size_t) layer];
+        sa.n_exp = n_exp;
+        sa.bounds = d_bounds_;
+        sa.row0 = row0;
+        sa.max_rows = max_rows;
+        sa.n_embd = n_embd;
+        sa.n_ff = n_ff;
+        x3k::set_gate_up(sa, x, n_embd, row_tok + row0, h16 + (size_t) row0 * n_ff, n_ff, cs);
+        x3k::set_down(sa, h16 + (size_t) row0 * n_ff, n_ff, y + (size_t) row0 * n_embd, n_embd, cs);
+    };
+    // the experts in VRAM: one set
+    const std::vector<int>& slots = slots_[(size_t) layer];
+    host_bounds_.resize((size_t) n_expert_ + 1);
+    int max_rows = 0, rows = 0;
+    for (size_t i = 0; i < slots.size(); ++i) {
+        host_bounds_[i] = rows;
+        rows += cnt[slots[i]];
+        max_rows = std::max(max_rows, cnt[slots[i]]);
+        n_resident += cnt[slots[i]] > 0;
+    }
+    host_bounds_[slots.size()] = rows;
+    if (rows > 0) {
+        if (cudaMemcpy(d_bounds_, host_bounds_.data(), (slots.size() + 1) * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "EXL3 pack: cannot upload the prompt's expert bounds";
+            return false;
+        }
+        launch(arena_[(size_t) layer], (size_t) L.blob(), (int) slots.size(), 0, max_rows);
+    }
+    // the others: read, uploaded and run a staging buffer at a time
+    std::vector<int> miss;
+    for (int e = 0; e < n_expert_; ++e)
+        if (cnt[e] > 0 && host_table_[(size_t) layer * n_expert_ + e] == 0ull) miss.push_back(e);
+    if (miss.empty()) return true;
+    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+        err = "EXL3 pack: the prompt's experts in VRAM failed";
+        return false;
+    }
+    const size_t blob = (size_t) L.blob();
+    host_stage_.resize((size_t) kStage * max_blob_);
+    if (stage_files_.empty()) {
+        stage_files_.resize((size_t) kStage);
+        for (auto& r : stage_files_)
+            for (const std::string& name : table_.files)
+                r.emplace_back((std::filesystem::path(dir_) / name).string(), std::ios::binary);
+    }
+    for (size_t j0 = 0; j0 < miss.size(); j0 += kStage) {
+        const int m = (int) std::min(miss.size() - j0, (size_t) kStage);
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> workers;
+        for (int i = 0; i < m; ++i)
+            workers.emplace_back([&, i] {
+                if (!read_blob(L, miss[j0 + i], stage_files_[(size_t) i], host_stage_.data() + (size_t) i * blob)) failed = true;
+            });
+        for (std::thread& w : workers) w.join();
+        if (failed) {
+            err = "EXL3 pack: a read of layer " + std::to_string(layer) + "'s experts failed";
+            return false;
+        }
+        const int row0 = starts[miss[j0]];
+        int at = row0, most = 0;
+        for (int i = 0; i < m; ++i) {
+            host_bounds_[(size_t) i] = at;
+            at += cnt[miss[j0 + i]];
+            most = std::max(most, cnt[miss[j0 + i]]);
+        }
+        host_bounds_[(size_t) m] = at;
+        if (cudaMemcpy(d_stage_, host_stage_.data(), (size_t) m * blob, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_bounds_, host_bounds_.data(), ((size_t) m + 1) * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "EXL3 pack: cannot upload the prompt's experts";
+            return false;
+        }
+        launch(d_stage_, blob, m, row0, most);
+        if (cudaStreamSynchronize(cs) != cudaSuccess) {
+            err = "EXL3 pack: the prompt's staged experts failed";
+            return false;
+        }
+        n_streamed += m;
     }
     return true;
 }

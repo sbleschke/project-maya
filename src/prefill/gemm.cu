@@ -1,5 +1,9 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
+#include "strata/kernels/exl3.hpp"
+
+#include <algorithm>
+#include <string>
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/prefill/failure.hpp"
 
@@ -422,6 +426,21 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta) {
+    if (ggml_type == strata::kernels::exl3::kTypeEXL3) {
+        // decoded once into the scratch and multiplied by cuBLAS, in slices of whole 128-row output rotation blocks: at
+        // a chunk's 1-2K rows this beats exl3::gemm_rows, which decodes again every 32 rows (glm_prefill.cu measured it)
+        namespace x3 = strata::kernels::exl3;
+        const x3::Mat& m = *(const x3::Mat*) W_blocks;
+        const int64_t rows = (scratch_elems_ / K) / 128 * 128;
+        if (rows <= 0) strata::prefill::fail("prefill gemm: the scratch is too small for K=" + std::to_string((long long) K));
+        if (ldy <= 0) ldy = N;
+        for (int64_t r0 = 0; r0 < N; r0 += rows) {
+            const int64_t n = std::min(N - r0, rows);
+            x3::reconstruct_rows(x3::view(m, (int) r0, (int) n), scratch_, false, (cudaStream_t) stream_);
+            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+        }
+        return;
+    }
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
