@@ -42,12 +42,15 @@ class NativeHead;
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                              int64_t layer);
 
+class QwenExl3;
+
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
+    QwenExl3* x3 = nullptr;               ///< an EXL3 pack: its experts in VRAM instead of all of the above
 };
 
 class Verifier {

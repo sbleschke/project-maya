@@ -43,10 +43,11 @@ __device__ __forceinline__ float warp_sum(float value) {
 }
 template<int BlockSize>
 __global__ void norm(const float* input, const float* __restrict__ gamma, float* output,
-                     int n_cols, float epsilon) {
+                     int n_cols, float epsilon, int n_gamma) {
     const int tid = threadIdx.x;
     const std::size_t row_offset = std::size_t(blockIdx.x) * n_cols;
     input += row_offset; output += row_offset;
+    gamma += std::size_t(blockIdx.x % n_gamma) * n_cols;
     float partial = 0.0f;
     for (std::size_t col = tid; col < std::size_t(n_cols); col += BlockSize) {
         const float x = input[col];
@@ -112,9 +113,22 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
         throw std::invalid_argument("native QSA requires finite nonnegative epsilon");
     buffers(input, count * 4, gamma, std::size_t(n_cols) * 4, output, stream);
     if (n_cols < 1024)
-        norm<256><<<unsigned(n_rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon);
+        norm<256><<<unsigned(n_rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon, 1);
     else
-        norm<1024><<<unsigned(n_rows), 1024, 0, static_cast<cudaStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon);
+        norm<1024><<<unsigned(n_rows), 1024, 0, static_cast<cudaStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon, 1);
+    check_launch();
+}
+
+void native_qsa_rms_norm_streams(const float* input, const float* gamma, float* output, int n_cols, int n_streams,
+                                 int n_rows, float epsilon, void* stream) {
+    const auto count = elements(n_cols, n_rows * n_streams);
+    if (n_streams < 1 || !std::isfinite(epsilon) || epsilon < 0.0f)
+        throw std::invalid_argument("native QSA requires streams and finite nonnegative epsilon");
+    buffers(input, count * 4, gamma, std::size_t(n_cols) * n_streams * 4, output, stream);
+    if (n_cols < 1024)
+        norm<256><<<unsigned(n_rows * n_streams), 256, 0, static_cast<cudaStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon, n_streams);
+    else
+        norm<1024><<<unsigned(n_rows * n_streams), 1024, 0, static_cast<cudaStream_t>(stream)>>>(input, gamma, output, n_cols, epsilon, n_streams);
     check_launch();
 }
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
