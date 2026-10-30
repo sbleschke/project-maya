@@ -1165,6 +1165,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(ple_reader_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_reader_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
+  # An EXL3 n-gram table's rows against exllamav3's own decode (tools/exl3_ngram_fixture.py's fixtures).
+  add_test(NAME ple_reader_trellis COMMAND ple_reader_test --trellis-fixtures ${CMAKE_CURRENT_SOURCE_DIR}/data/exl3-exllamav3)
 
   # The GPU test runs ON THE TARGET PC. `--selftest` allocates
   # and writes real VRAM, so a machine without a device fails this test rather than skipping it silently -

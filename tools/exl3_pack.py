@@ -210,6 +210,9 @@ class Plan:
     def bf16(self, gname, shape, fn):
         self.floats.append((gname, shape, "BF16", fn))
 
+    def f16(self, gname, shape, fn):
+        self.floats.append((gname, shape, "F16", fn))
+
     def gguf_only(self, n0: int):
         """The floats added since index n0 go into maya-exl3.gguf but not into index.txt / dense.bin."""
         self.floats[n0:] = [(n, sh, ty + ":gguf", fn) for n, sh, ty, fn in self.floats[n0:]]
@@ -489,11 +492,12 @@ def replace_atomic(path: pathlib.Path):
 
 
 def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: int,
-              template: pathlib.Path | None) -> None:
+              template: pathlib.Path | None, meta: list | None = None, tok: dict | None = None) -> None:
+    """meta / tok: another architecture's GGUF keys and tokenizer (tools/qwen/pack.py); by default GLM-5.3-Flash's."""
     st = plan.st
     n_layers = t["num_hidden_layers"]
-    meta = model_meta(t, n_layers, nextn)
-    tok = tokenizer_meta(d, t["vocab_size"], template)
+    meta = model_meta(t, n_layers, nextn) if meta is None else meta
+    tok = tokenizer_meta(d, t["vocab_size"], template) if tok is None else tok
     w = GGUFWriter(alignment=32)
     for k, v, ty in meta:
         w.add(k, v, ty)
@@ -526,6 +530,9 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
             lost_total += lost
             data = b.tobytes()
             kind = "4"
+        elif ty == "F16":
+            data = a.astype("<f2").tobytes()
+            kind = "5"
         else:
             data = a.tobytes()
             kind = "2"
@@ -570,7 +577,7 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
     by = {n: data for n, _, _, data in tensors}
     with replace_atomic(out / "dense.bin") as f:
         for r in rows:
-            if r[2] not in ("2", "4"):
+            if r[2] not in ("2", "4", "5"):
                 continue
             data = by[r[0]]
             r[3] = str(at)
@@ -590,7 +597,8 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
     with replace_atomic(out / "native_experts.txt") as fb, io.TextIOWrapper(fb, encoding="utf-8", newline="\n") as f:
         f.write("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
                 "[shard | gate_shard up_shard down_shard] (n_expert %d, total 0; absolute offsets in %s, or in the "
-                "named shard(s) beside it) - EXL3: the experts are in exl3.txt\n" % (t["n_routed_experts"], GGUF_NAME))
+                "named shard(s) beside it) - EXL3: the experts are in exl3.txt\n"
+                % (t.get("n_routed_experts", t.get("num_experts")), GGUF_NAME))
 
     # ---- exl3.txt
     with replace_atomic(out / "exl3.txt") as fb, io.TextIOWrapper(fb, encoding="utf-8", newline="\n") as f:
@@ -614,7 +622,7 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
                 f.write("e %d %d %s\n" % (L["layer"], e, " ".join("%d %d %d %d %d %d" % p for p in parts)))
     n_exp = sum(len(L["rows"]) for L in plan.layers)
     print("pack: %d float rows (dense.bin %.2f GB), %d EXL3 matrices, %d MoE layers x %d experts"
-          % (sum(1 for r in rows if r[2] in "24"), at / 1e9, len(plan.mats), len(plan.layers),
+          % (sum(1 for r in rows if r[2] in "245"), at / 1e9, len(plan.mats), len(plan.layers),
              n_exp // max(1, len(plan.layers))))
 
     # ---- tokenizer/ through the GGUF, as for every other pack

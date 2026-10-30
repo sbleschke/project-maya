@@ -1,6 +1,6 @@
 // include/strata/ngram/ple_reader.hpp - plan v0.3 P2: the n-gram table read straight from the SSD.
 //
-// The table is 320,001,536 rows of 90 bytes (26.8 GiB) and is never held in RAM: every row comes from an
+// The table is 320,001,536 rows of 90 bytes (26.8 GiB; an EXL3 table's rows: 2 + 20 K bytes) and is never held in RAM: every row comes from an
 // unbuffered 4 KiB read (platform::DirectFile). A token needs 16 rows on 16 different pages, and all 16 depend
 // on the token itself, so the only time to hide them is the embedding plus layer 0. Hence the split API:
 //
@@ -11,7 +11,7 @@
 // `issue` also serves prefill: pass all 16 x N rows of a chunk; pages are deduplicated, sorted by offset and
 // kept at most `max_inflight` deep, so a chunk's reads can run while the previous chunk computes.
 //
-// THE ROW CACHE IS NOT THE TABLE. It keeps rows this process has already fetched (90 bytes each, bounded,
+// THE ROW CACHE IS NOT THE TABLE. It keeps rows this process has already fetched (a row's bytes each, bounded,
 // clock eviction). Measured on the frozen corpus (bench/results/2026-09-23-ngram-io): 1M rows (~95 MB)
 // would serve up to ~82% of reads; within one long prompt 20-34% of rows recur. Capacity 0 disables it.
 #pragma once
@@ -24,7 +24,7 @@
 
 namespace strata::ngram {
 
-inline constexpr uint32_t ROW_BYTES = 90;
+inline constexpr uint32_t ROW_BYTES = 90;      // an IQ4_NL table's row; open's row_bytes takes another format's
 inline constexpr uint32_t PAGE = 4096;
 
 struct ReaderStats {
@@ -55,14 +55,14 @@ public:
     /// `table_offset` is the byte offset of row 0 in the file and `n_rows` the row count; both come from a
     /// validated GGUF parse (PleTable::open checks the table exactly fills the file from there).
     /// `io_thread` (default): a worker thread submits and reaps reads, so `issue` costs the caller no ReadFile
-    /// calls. false: the caller's thread does it (A/B arm).
+    /// calls. false: the caller's thread does it (A/B arm). `row_bytes`: a row's size, 1 .. PAGE.
     bool open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,
-              uint64_t cache_rows, std::string& err, bool io_thread = true);
+              uint64_t cache_rows, std::string& err, bool io_thread = true, uint32_t row_bytes = ROW_BYTES);
     void close();
     bool is_open() const;
 
-    /// Start fetching `n` rows; row i's 90 raw bytes land at `out_raw + 90 * i`. `out_raw` must stay valid
-    /// until `collect` returns. Out-of-range rows produce 90 zero bytes (the mmap path's behaviour).
+    /// Start fetching `n` rows; row i's raw bytes land at `out_raw + row_bytes * i`. `out_raw` must stay valid
+    /// until `collect` returns. Out-of-range rows produce zero bytes (the mmap path's behaviour).
     Ticket issue(const uint32_t* rows, size_t n, uint8_t* out_raw);
 
     /// Block until every row of the ticket is in `out_raw`. Returns false on an I/O error (message in `err`).

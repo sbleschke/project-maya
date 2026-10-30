@@ -6,8 +6,12 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <vector>
 #include <stdexcept>
 
@@ -107,6 +111,50 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+namespace {
+/// All 65536 mul1 values, each rounded to fp16 (exllamav3's mul1_codebook).  The product of the 11-bit sum and the
+/// 11-bit inverse is exact in F32, so an FMA and a separate add give the same bits.
+const std::vector<float>& mul1_values() {
+    static const std::vector<float> table = [] {
+        std::vector<float> t(65536);
+        const float k_inv = f32_from_f16(0x1eee), k_bias = f32_from_f16(0xc931);
+        for (uint32_t s = 0; s < 65536; ++s) {
+            const uint32_t x = s * 0x83DCD12Du;
+            const uint32_t sum = (x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24);
+            const float v = (1024.0f + (float) sum) * k_inv + k_bias;
+            t[s] = f32_from_f16(f16_from_f32(v));
+        }
+        return t;
+    }();
+    return table;
+}
+}  // namespace
+
+void ngram_trellis_dequant_row(const uint8_t* row, int K, const float* bias160, float* out160) {
+    const std::vector<float>& cb = mul1_values();
+    const int n_words = PLE_HEAD_DIM * K / 16;
+    uint16_t w[1 + PLE_HEAD_DIM * PLE_TRELLIS_MAX_K / 16];
+    std::memcpy(w, row, (size_t) (1 + n_words) * 2);
+    const float scale = f32_from_f16(w[0]);
+    const uint16_t* stream = w + 1;
+    const uint32_t mask = (1u << K) - 1u;
+    // the symbols, the last ones again in front: an element's state reaches back (15 + K) / K symbols, around the ring
+    const int back = (15 + K) / K - 1;
+    uint8_t sym_store[PLE_HEAD_DIM + 16];
+    uint8_t* sym = sym_store + back;
+    for (int i = 0; i < PLE_HEAD_DIM; ++i) {
+        const int bit = i * K, at = bit >> 4;
+        const uint32_t window = (uint32_t) stream[at] | ((uint32_t) stream[(at + 1) % n_words] << 16);
+        sym[i] = (uint8_t) ((window >> (bit & 15)) & mask);
+    }
+    for (int j = 1; j <= back; ++j) sym[-j] = sym[PLE_HEAD_DIM - j];
+    for (int i = 0; i < PLE_HEAD_DIM; ++i) {
+        uint32_t state = 0;
+        for (int j = 0; j <= back; ++j) state |= (uint32_t) sym[i - j] << (j * K);
+        out160[i] = f32_from_f16(f16_from_f32(cb[state & 0xFFFFu] * scale + bias160[i]));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 struct PleTable::Impl {
     GgufFile* file = nullptr;
@@ -120,7 +168,24 @@ struct PleTable::Impl {
     strata::ngram::PleReader::Ticket ticket;
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
-    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES] = {};
+    uint8_t raw[PLE_N_HEADS * PLE_MAX_ROW_BYTES] = {};
+    // an EXL3 table (open_trellis): K != 0, rows of 2 + 20 K bytes, each decoded with its head's bias
+    int K = 0;
+    uint32_t row_bytes = PLE_ROW_BYTES;
+    uint64_t head_offsets[PLE_N_HEADS] = {};
+    std::vector<float> head_bias;
+
+    void decode(uint32_t row, const uint8_t* bytes, float* out160) const {
+        if (K == 0) {
+            iq4nl_dequant_row(bytes, out160);
+        } else if (row >= n_rows) {
+            std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));   // (the IQ4_NL path's zeros: scale 0, no bias)
+        } else {
+            const int head = (int) (std::upper_bound(head_offsets, head_offsets + PLE_N_HEADS, (uint64_t) row) -
+                                    head_offsets) - 1;
+            ngram_trellis_dequant_row(bytes, K, head_bias.data() + (size_t) head * PLE_HEAD_DIM, out160);
+        }
+    }
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -130,7 +195,102 @@ bool PleTable::open(const std::string& gguf_path, std::string& err) {
     return open(gguf_path, err, PleIoOptions{});
 }
 
+bool PleTable::open_trellis(const std::string& txt_path, std::string& err, const PleIoOptions& io) {
+    close();
+    if (io.mode != PleIo::Direct) {
+        err = "an EXL3 n-gram table is read Direct only (no --ple-io mmap)";
+        return false;
+    }
+    std::ifstream txt(txt_path);
+    if (!txt) {
+        err = "cannot read " + txt_path;
+        return false;
+    }
+    std::map<std::string, std::string> kv;
+    for (std::string line; std::getline(txt, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        const size_t sp = line.find(' ');
+        if (sp != std::string::npos) kv[line.substr(0, sp)] = line.substr(sp + 1);
+    }
+    const auto number = [&](const char* key, uint64_t& out) {
+        const auto it = kv.find(key);
+        if (it == kv.end() || it->second.empty() || it->second.find_first_not_of("0123456789") != std::string::npos) {
+            err = txt_path + ": no number for " + key;
+            return false;
+        }
+        out = std::stoull(it->second);
+        return true;
+    };
+    uint64_t K = 0, row_dim = 0, row_bytes = 0, n_rows = 0, heads = 0;
+    uint64_t table_off = 0, bias_off = 0, offsets_off = 0, vocab_off = 0, mult_off = 0;
+    if (!number("K", K) || !number("row_dim", row_dim) || !number("row_bytes", row_bytes) || !number("rows", n_rows) ||
+        !number("heads", heads) || !number("table_off", table_off) || !number("head_bias_off", bias_off) ||
+        !number("head_offsets_off", offsets_off) || !number("head_vocab_sizes_off", vocab_off) ||
+        !number("layer_multipliers_off", mult_off))
+        return false;
+    if (kv["format"] != "exl3_ngram_trellis") {
+        err = txt_path + ": format '" + kv["format"] + "', not exl3_ngram_trellis";
+        return false;
+    }
+    if (K < 1 || K > (uint64_t) PLE_TRELLIS_MAX_K || row_dim != (uint64_t) PLE_HEAD_DIM ||
+        row_bytes != 2 + row_dim * K / 8 || heads != (uint64_t) PLE_N_HEADS) {
+        err = txt_path + ": the row geometry is not a 160-wide table of K 1..8 with 16 heads";
+        return false;
+    }
+    std::string file = kv["file"];
+    const bool absolute = !file.empty() && (file[0] == '/' || file[0] == '\\' || (file.size() > 1 && file[1] == ':'));
+    const size_t slash = txt_path.find_last_of("/\\");
+    if (!absolute && slash != std::string::npos) file = txt_path.substr(0, slash + 1) + file;
+    std::ifstream f(file, std::ios::binary);
+    const auto read_at = [&](uint64_t off, void* out, size_t n) {
+        f.seekg((std::streamoff) off);
+        f.read((char*) out, (std::streamsize) n);
+        if (!f) err = file + ": cannot read the table's parameters";
+        return (bool) f;
+    };
+    uint16_t bias[PLE_N_HEADS * PLE_HEAD_DIM];
+    int64_t offsets[PLE_N_HEADS], vocab[PLE_N_HEADS], mult[NGRAM_SIZE];
+    if (!f || !read_at(bias_off, bias, sizeof bias) || !read_at(offsets_off, offsets, sizeof offsets) ||
+        !read_at(vocab_off, vocab, sizeof vocab) || !read_at(mult_off, mult, sizeof mult)) {
+        if (err.empty()) err = "cannot open " + file;
+        return false;
+    }
+    f.close();
+    // (<=: the rows are rounded up to a multiple of 128, and the last few belong to no hash)
+    if (offsets[PLE_N_HEADS - 1] + vocab[PLE_N_HEADS - 1] > (int64_t) n_rows) {
+        err = file + ": the heads reach past the table's rows";
+        return false;
+    }
+    if (!io.any_hash) {
+        const PleConsts c = ple_artifact_consts();
+        bool same = n_rows == PLE_TABLE_ROWS;
+        for (int i = 0; i < PLE_N_HEADS; ++i)
+            same = same && (uint64_t) offsets[i] == c.offset[i] && (uint64_t) vocab[i] == c.vocab[i];
+        for (int i = 0; i < NGRAM_SIZE; ++i) same = same && (uint64_t) mult[i] == c.mult[i];
+        if (!same) {
+            err = file + ": its hash constants are not Qwen3.8-Flash-Next's: every row read would be the wrong one";
+            return false;
+        }
+    }
+    if (!impl_->reader.open(file, table_off, n_rows, io.max_inflight, io.cache_rows, err, io.io_thread,
+                            (uint32_t) row_bytes)) {
+        close();
+        return false;
+    }
+    impl_->head_bias.resize((size_t) PLE_N_HEADS * PLE_HEAD_DIM);
+    for (size_t i = 0; i < impl_->head_bias.size(); ++i) impl_->head_bias[i] = f32_from_f16(bias[i]);
+    for (int i = 0; i < PLE_N_HEADS; ++i) impl_->head_offsets[i] = (uint64_t) offsets[i];
+    impl_->n_rows = n_rows;
+    impl_->K = (int) K;
+    impl_->row_bytes = (uint32_t) row_bytes;
+    impl_->mode = PleIo::Direct;
+    return true;
+}
+
 bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
+    if (gguf_path.size() > 4 && gguf_path.compare(gguf_path.size() - 4, 4, ".txt") == 0)
+        return open_trellis(gguf_path, err, io);
     close();
     try {
         impl_->file = new GgufFile(gguf_path);
@@ -207,6 +367,9 @@ void PleTable::close() {
     impl_->file = nullptr;
     impl_->data = nullptr;
     impl_->n_rows = 0;
+    impl_->K = 0;
+    impl_->row_bytes = PLE_ROW_BYTES;
+    impl_->head_bias.clear();
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
@@ -216,15 +379,15 @@ uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
 void PleTable::read_row(uint32_t row, float* out160) const {
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
-        uint8_t raw[PLE_ROW_BYTES];
+        uint8_t raw[PLE_MAX_ROW_BYTES];
         std::string err;
         const auto t = impl_->reader.issue(&row, 1, raw);
         if (!impl_->reader.collect(t, err)) {
             std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
             return;
         }
-        iq4nl_dequant_row(raw, out160);
-        impl_->bytes_read += PLE_ROW_BYTES;
+        impl_->decode(row, raw, out160);
+        impl_->bytes_read += impl_->row_bytes;
         return;
     }
     if (impl_->data == nullptr || row >= impl_->n_rows) {
@@ -266,8 +429,8 @@ bool PleTable::collect(float* out2560, std::string& err) {
     if (impl_->mode == PleIo::Direct) {
         if (!impl_->reader.collect(impl_->ticket, err)) return false;
         for (int h = 0; h < PLE_N_HEADS; ++h)
-            iq4nl_dequant_row(impl_->raw + (size_t) h * PLE_ROW_BYTES, out2560 + (size_t) h * PLE_HEAD_DIM);
-        impl_->bytes_read += (uint64_t) PLE_N_HEADS * PLE_ROW_BYTES;
+            impl_->decode(impl_->rows[h], impl_->raw + (size_t) h * impl_->row_bytes, out2560 + (size_t) h * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->row_bytes;
         return true;
     }
     for (int h = 0; h < PLE_N_HEADS; ++h) read_row(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM);
@@ -278,11 +441,11 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
-        std::vector<uint8_t> raw(n * PLE_ROW_BYTES);
+        std::vector<uint8_t> raw(n * impl_->row_bytes);
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
         if (!impl_->reader.collect(ticket, err)) return false;
-        for (size_t i = 0; i < n; ++i) iq4nl_dequant_row(raw.data() + i * PLE_ROW_BYTES, out + i * PLE_HEAD_DIM);
-        impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
+        for (size_t i = 0; i < n; ++i) impl_->decode(rows[i], raw.data() + i * impl_->row_bytes, out + i * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) n * impl_->row_bytes;
         return true;
     }
     for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
