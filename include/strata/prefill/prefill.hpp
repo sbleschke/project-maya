@@ -36,6 +36,7 @@ struct PrefillStats {
 
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
+class QwenExl3;
 namespace strata::prefill {
 
 class Prefill {
@@ -75,6 +76,8 @@ public:
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    /// An EXL3 pack: its routed experts come from here instead of `src` and `cache`.  Set before `run`.
+    void set_exl3(core::QwenExl3* x3);
 
     const PrefillStats& stats() const { return stats_; }
 

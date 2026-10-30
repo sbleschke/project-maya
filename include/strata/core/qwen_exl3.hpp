@@ -41,6 +41,13 @@ public:
     int64_t resident() const { return resident_; }
     int64_t experts() const { return (int64_t) table_.layers.size() * n_expert_; }
     uint64_t expert_vram_bytes() const { return expert_vram_; }
+    /// The prompt path: starts[e] = the first row of expert e's rows, given how many each has (cnt) - the experts in VRAM
+    /// first, in the order of their blobs, then the others by id.
+    void row_starts(int layer, const int32_t* cnt, int32_t* starts) const;
+    /// Every routed expert of `layer` over its rows: H16 [rows][n_ff] FP16 scratch, y [rows][n_embd] (each row r: x's row
+    /// row_tok[r], `row_tok` and `x` device buffers).  The experts not in VRAM come through a small staging buffer.
+    bool prompt_experts(int layer, const int32_t* cnt, const int32_t* starts, const float* x, const int32_t* row_tok,
+                        uint16_t* h16, float* y, int64_t& n_resident, int64_t& n_streamed, void* stream, std::string& err);
     /// (a token graph's layer) shared += sum of weights[i] * expert ids[i] over x, for the experts in VRAM.  ids, weights,
     /// x and shared are device buffers; k experts.
     bool layer_hits(int layer, const int32_t* ids, const float* weights, const float* x, float* shared, void* stream,
@@ -67,6 +74,14 @@ private:
     unsigned long long* d_table_ = nullptr;
     unsigned long long* d_plan_ = nullptr;            // [k]
     std::vector<strata::kernels::exl3::ExpertLayout> lay_;   // [layer]
+    std::vector<const uint8_t*> arena_;               // [layer]: its experts in VRAM, ascending id, a blob apart
+    std::vector<std::vector<int>> slots_;             // [layer]: those experts' ids
+    int* d_bounds_ = nullptr;                         // [n_expert + 1]
+    std::vector<int> host_bounds_;
+    uint8_t* d_stage_ = nullptr;                      // kStage blobs
+    std::vector<uint8_t> host_stage_;
+    std::vector<std::vector<std::ifstream>> stage_files_;   // [reader][file]
+    uint64_t max_blob_ = 0;
 };
 
 }  // namespace strata::core
