@@ -2873,6 +2873,14 @@ static bool mixed_ok(const MixedLayouts& mx, const char* what) {
     return ok;
 }
 
+__global__ void plan_from_table_kernel(const int32_t* ids, const unsigned long long* row, int k, unsigned long long* plan) {
+    if ((int) threadIdx.x < k) plan[threadIdx.x] = row[ids[threadIdx.x]];
+}
+void plan_from_table(const int32_t* ids, const unsigned long long* table_row, int k, unsigned long long* plan, cudaStream_t s) {
+    plan_from_table_kernel<<<1, 32, 0, s>>>(ids, table_row, k, plan);
+    launch_check("plan_from_table");
+}
+
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
     if (a.mix.n > 0) {   // (a mixed layer: the same arithmetic on every GPU, no legacy kernels)
         KMoe m;

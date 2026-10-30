@@ -127,6 +127,9 @@ struct MoeArgs {
 };
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
+/// plan[i] = table_row[ids[i]] for i < k (k <= 32, all device): a token's plan_ptr from the routed ids and a layer's
+/// table of blobs in VRAM (0: not on the device).
+void plan_from_table(const int32_t* ids, const unsigned long long* table_row, int k, unsigned long long* plan, cudaStream_t s);
 
 /// A verify window's routed experts, each distinct expert read once for all the tokens it serves (after exllamav3's
 /// fused MoE, which runs the slots that picked one expert as the rows of one tile): T tokens' plans [T][8] grouped by

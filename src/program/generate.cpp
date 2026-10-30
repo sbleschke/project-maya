@@ -4860,13 +4860,14 @@ int main(int argc, char** argv) {
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
     strata::core::layer_set_shared_early(!o.shared_late);
-    // An EXL3 pack of Qwen3.8-Flash-Next (tools/qwen/pack.py): its matrices as EXL3 on the GPU, its routed experts on
-    // the CPU (QwenExl3).  So far: one GPU, token by token, no drafter and no expert cache.
+    // An EXL3 pack of Qwen3.8-Flash-Next (tools/qwen/pack.py): its matrices as EXL3 on the GPU, its most-routed experts
+    // in VRAM as far as they fit (--vram-reserve-mib leaves room; --expert-profile ranks them), the others on the CPU
+    // (QwenExl3).  So far: one GPU, token by token, no drafter.
     const bool qwen_exl3 = o.glm_pack.empty() && std::filesystem::exists(std::filesystem::path(o.pack) / "exl3.txt");
     if (qwen_exl3 && (!o.native_preset.empty() || o.prefill_chunk > 0 || o.spec > 0 || o.mtp_max_t > 0 || !o.mtp.empty() ||
-                      o.expert_cache != 0 || !o.expert_profile.empty() || !o.layer_split.empty() || o.vision)) {
+                      o.expert_cache != 0 || !o.layer_split.empty() || o.vision)) {
         std::fprintf(stderr, "maya generate: %s is an EXL3 pack: it takes no --native, --prefill, --spec, --mtp, "
-                             "--expert-cache, --expert-profile, --layer-split or --vision yet\n", o.pack.c_str());
+                             "--expert-cache, --layer-split or --vision yet\n", o.pack.c_str());
         return 2;
     }
     if (!o.native_preset.empty() || qwen_exl3) {
@@ -5541,7 +5542,7 @@ int main(int argc, char** argv) {
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
         // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
         // every pair (issue #46: a card that holds more than the old 8,000 used to stop there), so it means auto.
-        if (o.expert_cache == 0) o.expert_cache = -1;
+        if (o.expert_cache == 0 && !qwen_exl3) o.expert_cache = -1;
         std::fprintf(stderr, "maya generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
     }
@@ -6648,6 +6649,26 @@ int main(int argc, char** argv) {
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
     strata::core::TokenHits thits;
+    if (qwen_exl3) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            std::fprintf(stderr, "maya generate: cannot read the GPU's free memory\n");
+            return 1;
+        }
+        // (the reserve, and about 1 GiB for the graph's scratch and the kernels' own)
+        const uint64_t keep = ((uint64_t) std::max(o.vram_reserve_mib, 0) << 20) + (1ull << 30);
+        const uint64_t budget = (uint64_t) free_b > keep ? (uint64_t) free_b - keep : 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!qwen_x3.load_experts(profile, budget, (int) K, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "maya generate: EXL3 experts: %lld of %lld in VRAM (%.2f GiB, %.0f s), the others on the CPU\n",
+                     (long long) qwen_x3.resident(), (long long) qwen_x3.experts(),
+                     (double) qwen_x3.expert_vram_bytes() / 1073741824.0,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        thits.x3 = &qwen_x3;
+    }
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);

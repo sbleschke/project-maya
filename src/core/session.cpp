@@ -5,6 +5,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/core/qwen_exl3.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -833,7 +834,12 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         ok = block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k, s.block, (void*) cs, err, s.db,
                              s.ple.ready() ? &s.ple : nullptr);
         if (!ok) { err = "session_capture_token: pre layer " + std::to_string(l) + ": " + err; break; }
-        if (hits != nullptr) {
+        if (hits != nullptr && hits->x3 != nullptr) {
+            // (needs the shared expert's output already written: its sum goes into it, and the combine adds the misses)
+            if (!layer_shared_early()) { err = "session_capture_token: an EXL3 pack's experts need the shared expert early"; ok = false; break; }
+            ok = hits->x3->layer_hits((int) l, s.moe.ids, s.moe.weights, s.block.mixed, s.moe.shared, (void*) cs, err);
+            if (!ok) break;
+        } else if (hits != nullptr) {
             // After the ring (and the shared expert): the GPU's experts run while the CPU computes the misses.
             strata::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
                                             (int) hits->n_expert, hits->d_slot, hits->d_dst, hits->d_count, (void*) cs);
@@ -845,7 +851,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
         // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
         strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
-        if (hits != nullptr)
+        if (hits != nullptr && hits->x3 == nullptr)
             strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
         ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err);
         if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
