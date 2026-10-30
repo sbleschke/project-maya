@@ -1,5 +1,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -12,7 +14,21 @@ namespace strata::core {
 
 NativeHead::~NativeHead() {
     if (scratch_) cudaFree(scratch_);
-    if (weights_) cudaFree(weights_);
+    if (weights_ && owned_) cudaFree(weights_);
+}
+
+bool NativeHead::load_exl3(const void* mat, int64_t n_in, int64_t n_out, std::string& err) {
+    if (loaded()) { err = "native head is already loaded"; return false; }
+    if (!mat || n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX) {
+        err = "native head: an EXL3 head needs its matrix and positive int32 dimensions";
+        return false;
+    }
+    weights_ = const_cast<void*>(mat);
+    owned_ = false;
+    n_in_ = (int) n_in;
+    n_out_ = (int) n_out;
+    type_ = strata::kernels::exl3::kTypeEXL3;
+    return true;
 }
 
 bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std::string& err) {
@@ -74,7 +90,16 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
         return false;
     }
     try {
-        if (type_ == 13) {
+        if (type_ == strata::kernels::exl3::kTypeEXL3) {
+            strata::kernels::exl3::MvJob j;
+            j.m = (const strata::kernels::exl3::Mat*) weights_;
+            j.xf = mixed;
+            j.y = logits;
+            if (!strata::kernels::exl3::mv(&j, 1, (cudaStream_t) stream)) {
+                err = "native head: the EXL3 launch failed";
+                return false;
+            }
+        } else if (type_ == 13) {
             strata::kernels::native_q5_k_f32(weights_, mixed, scratch_, logits, n_in_, n_out_, 1, stream);
         } else {
             strata::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
@@ -96,6 +121,7 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
 
 namespace {
 const NativeEmbed* g_embed = nullptr;
+constexpr int kBf16 = 30;   // ggml's type id
 }
 void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
@@ -111,12 +137,12 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         for (const auto& c : gguf.tensors())
             if (c.name == "token_embd.weight") t = &c;
         if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
-            !strata::kernels::iq_supported((int) t->type) || n_embd % 256) {
+            !(strata::kernels::iq_supported((int) t->type) || (int) t->type == kBf16) || n_embd % 256) {
             err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
                   "dequantizer";
             return false;
         }
-        row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
+        row_ = (int) t->type == kBf16 ? (size_t) n_embd * 2 : strata::kernels::iq_row_bytes((int) t->type, n_embd);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
         if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             host_ = nullptr;
@@ -141,11 +167,13 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
 }
 
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
-    strata::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream);
+    if (type_ == kBf16) strata::kernels::bf16_embed_rows(dev_, tokens, n_tok, n_embd_, out, stream);
+    else strata::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream);
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    if (type_ == kBf16) strata::kernels::bf16_row_f32((const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    else strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
 }
 
 }  // namespace strata::core

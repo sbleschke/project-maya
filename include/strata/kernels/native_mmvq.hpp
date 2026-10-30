@@ -103,7 +103,7 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 // dependency in the engine: Q4_0=2, Q5_0=6, Q8_0=8, Q3_K=11, Q4_K=12, Q5_K=13,
 // Q6_K=14, IQ4_NL=20, IQ4_XS=23, Q2_0=42. Unsupported IDs throw in the byte-count
 // and launch helpers; only the
-// capability query returns false.
+// capability query returns false.  exl3::kTypeEXL3 (200): `weights` is a const exl3::Mat*.
 bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,

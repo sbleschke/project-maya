@@ -26,6 +26,11 @@ namespace strata::kernels {
 /// `strata::core::WeightRef::ne0/ne1` already report.
 void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream);
 
+/// A BF16 table's rows as F32: `tokens` (device, n_tok ids) into out [n_tok][n_embd] - an EXL3 pack's token embedding.
+void bf16_embed_rows(const void* table, const int32_t* tokens, int64_t n_tok, int64_t n_embd, float* out, void* stream);
+/// One row of it, n values from `src`.
+void bf16_row_f32(const void* src, int64_t n, float* out, void* stream);
+
 /// The row-split variant, for the same reason `s_gemv_split` exists: with one thread per output row the
 /// parallelism IS the output width, and `ssm_alpha` has 48 of them over 48 SMs.  One warp per row, lanes
 /// striding the reduction axis - which is also what makes the access pattern coalesced in this layout.

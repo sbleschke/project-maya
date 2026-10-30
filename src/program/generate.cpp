@@ -44,6 +44,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/core/qwen_exl3.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -571,13 +572,15 @@ struct Drive {
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
+    strata::core::QwenExl3* exl3 = nullptr;   ///< an EXL3 pack: its experts, instead of `d`
 };
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
     Drive* t = (Drive*) user;
     const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
+    if (t->exl3 != nullptr) t->exl3->experts_run((int) t->d.layers++, x_f, ids, n_embd, k, out);
+    else strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
     // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
@@ -4857,7 +4860,16 @@ int main(int argc, char** argv) {
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
     strata::core::layer_set_shared_early(!o.shared_late);
-    if (!o.native_preset.empty()) {
+    // An EXL3 pack of Qwen3.8-Flash-Next (tools/qwen/pack.py): its matrices as EXL3 on the GPU, its routed experts on
+    // the CPU (QwenExl3).  So far: one GPU, token by token, no drafter and no expert cache.
+    const bool qwen_exl3 = o.glm_pack.empty() && std::filesystem::exists(std::filesystem::path(o.pack) / "exl3.txt");
+    if (qwen_exl3 && (!o.native_preset.empty() || o.prefill_chunk > 0 || o.spec > 0 || o.mtp_max_t > 0 || !o.mtp.empty() ||
+                      o.expert_cache != 0 || !o.expert_profile.empty() || !o.layer_split.empty() || o.vision)) {
+        std::fprintf(stderr, "maya generate: %s is an EXL3 pack: it takes no --native, --prefill, --spec, --mtp, "
+                             "--expert-cache, --expert-profile, --layer-split or --vision yet\n", o.pack.c_str());
+        return 2;
+    }
+    if (!o.native_preset.empty() || qwen_exl3) {
         if (o.no_ple || o.ple_gguf.empty()) {
             std::fprintf(stderr, "maya generate: --native requires --ple-gguf (the PLE key is native too)\n");
             return 2;
@@ -4867,8 +4879,9 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
-        if (o.native_dense_gguf.empty()) {
+        if (qwen_exl3) o.native_ple_key = false;   // (its PLE key is BF16 in the pack)
+        if (o.native_head_gguf.empty() && !qwen_exl3) o.native_head_gguf = o.native_preset;
+        if (o.native_dense_gguf.empty() && !qwen_exl3) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
             // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
             o.native_dense_gguf = model_shards(o.native_preset);
@@ -4950,7 +4963,8 @@ int main(int argc, char** argv) {
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
         const strata::core::ModelGeometry g0;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        // (an EXL3 pack's experts are QwenExl3's: its native_experts.txt only names exl3.txt)
+        if (!strata::kernels::cpu::expert_layout_load(qwen_exl3 ? std::string() : o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -4989,12 +5003,22 @@ int main(int argc, char** argv) {
         }
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
-    if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
+    if (qwen_exl3) {
+    } else if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "maya generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
                      std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::NativeEmbed native_embed;
+    if (qwen_exl3) {
+        const strata::core::ModelGeometry g0;
+        const std::string gguf = (std::filesystem::path(o.pack).parent_path() / "maya-exl3.gguf").string();
+        if (!native_embed.load(gguf, g0.n_embd, 248320, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        strata::core::set_native_embed(&native_embed);
+    }
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
             (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
@@ -5027,6 +5051,10 @@ int main(int argc, char** argv) {
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         if (native_pack) skip.insert("token_embd.weight");
     }
+    if (qwen_exl3 && !strata::core::QwenExl3::served_names(o.pack, skip, err)) {
+        std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+        return 1;
+    }
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -5047,6 +5075,15 @@ int main(int argc, char** argv) {
                          "served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), skip.size());
 
+    strata::core::QwenExl3 qwen_x3;
+    if (qwen_exl3) {
+        if (!qwen_x3.load(o.pack, (int) strata::core::ModelGeometry{}.n_expert, wt, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "maya generate: EXL3 pack: %zu matrices on the GPU, %.2f GiB; routed experts on the CPU\n",
+                     qwen_x3.mat_count(), (double) qwen_x3.vram_bytes() / (1024.0 * 1024.0 * 1024.0));
+    }
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
@@ -5426,7 +5463,7 @@ int main(int argc, char** argv) {
     const bool gguf_capable = native_pack && !o.mmap_experts && !o.native_preset.empty() &&
                               !std::filesystem::exists(std::filesystem::path(o.pack) / "experts.bin") &&
                               !strata::kernels::cpu::expert_layout().gguf_off.empty();
-    const bool from_gguf = gguf_capable &&
+    const bool from_gguf = !qwen_exl3 && gguf_capable &&
         (o.experts_from_gguf == "on" ||
          (o.experts_from_gguf == "auto" &&
           strata::core::expert_ram_room() < strata::kernels::cpu::expert_layout().total + (2ull << 30)));
@@ -5438,6 +5475,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya generate: %s (the RAM tier is chosen once the GPUs hold theirs)\n",
                      gguf_src.note().c_str());
         srcp = &gguf_src;
+    } else if (qwen_exl3) {
+        // (QwenExl3 reads each routed expert from the model's files: no ExpertSource)
     } else if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
@@ -5643,7 +5682,16 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "maya generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
-    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+    if (qwen_exl3) {
+        if (multi_gpu) {
+            std::fprintf(stderr, "maya generate: an EXL3 pack runs on one GPU so far\n");
+            return 2;
+        }
+        if (!native_head.load_exl3(qwen_x3.mat("output.weight"), g.n_embd, n_vocab, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+    } else if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
@@ -6036,6 +6084,7 @@ int main(int argc, char** argv) {
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
     drive.d.src = srcp;
+    if (qwen_exl3) drive.exl3 = &qwen_x3;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
@@ -9148,7 +9197,7 @@ int main(int argc, char** argv) {
             std::printf("%-24s   wait-park %.3f  drain %.3f  re-park %.3f  ms/token\n",
                         "  pool phases", wp / per, dr / per, rp / per);
         }
-        std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
+        if (srcp != nullptr) std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
             std::printf("  CUDA%d experts           %lld routed entries computed\n",
                         r + 1, (long long) remote_experts[(size_t) r].computed());
