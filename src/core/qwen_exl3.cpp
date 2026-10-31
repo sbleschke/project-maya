@@ -448,10 +448,13 @@ void QwenExl3::experts_run(int layer, const float* x, const int32_t* ids, int64_
     std::vector<std::thread> workers;
     workers.reserve((size_t) k);
     for (int64_t i = 0; i < k; ++i) {
-        if (!host_table_.empty() && host_table_[(size_t) layer * n_expert_ + ids[i]] != 0ull)
+        if (!host_table_.empty() && host_table_[(size_t) layer * n_expert_ + ids[i]] != 0ull) {
             std::memset(out + i * n_embd, 0, (size_t) n_embd * sizeof(float));   // (layer_hits has it)
-        else
-            workers.emplace_back([=, this] { expert((int) i, layer, ids[i], x, out + i * n_embd); });
+            ++routed_vram_;
+            continue;
+        }
+        ++routed_disk_;
+        workers.emplace_back([=, this] { expert((int) i, layer, ids[i], x, out + i * n_embd); });
     }
     for (std::thread& t : workers) t.join();
 }

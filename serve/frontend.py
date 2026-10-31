@@ -92,6 +92,8 @@ class ChatTemplate:
         # "args"}<|end_message|> - which InklingRewriter turns into what OutputParser reads; reasoning_effort by name
         # (none .. max, its effort_map) or a number; tool call arguments must be objects
         self.inkling = "<|content_invoke_tool_json|>" in self.source and "effort_map" in self.source
+        # a Qwen3.8 template's reasoning efforts are low, medium and xhigh (CYBER-FROST's and its base's)
+        self.qwen_efforts = self.forced_thinking or "Supported types are xhigh" in self.source
 
     def effort_shown(self, value) -> str | None:
         """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in

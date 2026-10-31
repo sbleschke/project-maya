@@ -227,6 +227,7 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
           ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS",   # (the base model in unsloth's GGUF: maya.QWEN_UD)
+          ("qwen", "exl3"): "EXL3 3.18 bpw", ("qwen", "exl3-own"): "your EXL3 folder",
           ("hy4", "q4_k_m"): "Q4_K_M",                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
           ("ik2", "ud-q4_k_xl"): "unsloth UD-Q4_K_XL"}  # (unsloth's GGUF of Inkling-2-Mini: maya.IK2)
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"
@@ -242,6 +243,9 @@ HY4_IDS = ("hy4-flash-q4_k_m", "hy4-q4_k_m")
 # for by (the first: the Models page's)
 IK2_IDS = ("inkling-2-mini", "inkling-2-mini-ud-q4_k_xl", "inkling2-mini", "ik2-mini")
 IK2_QUANT = "ud-q4_k_xl"
+# Qwen3.8-Flash-Next itself in turboderp's EXL3 quant: the base model, so no "CYBER-FROST" in its name on screen
+QWEN_EXL3_IDS = ("qwen-exl3", "qwen3.8-exl3", "qwen3.8-flash-next-exl3")
+QWEN_BASE_SHOWN = "Qwen-3.8-Flash-Next"
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
 MM3_QUANT_ALIASES = {"maya-xs": "gguf-xs", "maya-s": "gguf-s"}
 
@@ -265,7 +269,8 @@ def full_name(family: str, key: str | None) -> str | None:
 def shown(family: str, key: str | None = None, gb: float | None = None) -> str:
     """The files as users see them, the model's name first: "MiniMax M3.1 · Maya-XS", with gb "... (93 GB)"; never a
     bare tier.  Files that are not a Maya quant by their own name ("DeepSeek V4.1 · UD-Q8_K_XL"); no key: the model."""
-    name = SHOWN_KEY.get((family, key)) or SHOWN.get(family, family)
+    name = QWEN_BASE_SHOWN if family == "qwen" and str(key).startswith("exl3") else \
+        SHOWN_KEY.get((family, key)) or SHOWN.get(family, family)
     what = tier(family, key) or OTHERS.get((family, key)) or key
     return (name + SEP + what if what else name) + (f" ({gb:.0f} GB)" if gb else "")
 
@@ -275,7 +280,8 @@ def config_stem(family: str, key: str | None) -> str | None:
     always had (GLM's maya-<download>.json, DeepSeek's maya-ds4.json, MiniMax's EXL3 maya-mm3.json - installs and
     their run scripts point at them; a second DeepSeek quant beside the first: maya.ds4_config_path's own name).  MiniMax's GGUFs, new with the scheme, are the first named by it."""
     if family == "qwen":
-        return "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
+        return "maya-qwen-exl3" if str(key).startswith("exl3") else \
+            "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
     if family == "hy4" and key == "q4_k_m":            # (AngelSlim's Q4_K_M: the config's name since its first setup)
         return "maya-hy4-flash"
     if family == "ik2":                                # (Inkling-2-Mini: its one file set)
@@ -300,6 +306,8 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "qwen", "q5_k_m"
     if low in QWEN_UD_IDS:
         return "qwen", "ud-iq2_xs"
+    if low in QWEN_EXL3_IDS:
+        return "qwen", "exl3"
     if low in HY4_IDS:
         return "hy4", "q4_k_m"
     if low == "hy4":                                   # (the model by its short name: its files then asked)

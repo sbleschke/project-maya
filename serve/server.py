@@ -6812,7 +6812,7 @@ def make_handler(svc: Service):
                     named = getattr(svc.template, "minimax", False) or getattr(svc.template, "inkling", False)
                     rec["reasoning_effort"] = (effort_name if named else effort_level)(
                         svc.default_effort) or svc.default_effort
-                    if getattr(svc.template, "forced_thinking", False):
+                    if getattr(svc.template, "qwen_efforts", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
                     if getattr(svc.template, "hy4", False):   # (Hy4-flash: the level it runs at, none / high)
                         rec["reasoning_effort"] = svc.template.effort_shown(svc.default_effort) or \
@@ -8223,7 +8223,7 @@ def main() -> int:
             svc.default_effort) or \
             (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
                                                      else "none")
-        if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
+        if getattr(svc.template, "qwen_efforts", False):   # (Qwen's words, low / medium / xhigh)
             level = QWEN_EFFORT.get(level, level)
         if getattr(svc.template, "hy4", False):               # (Hy4-flash: the level it runs at, none / high)
             level = svc.template.effort_shown(svc.default_effort) or level
