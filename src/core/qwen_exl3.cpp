@@ -155,7 +155,13 @@ bool read_blob(const Exl3Table::Layer& L, int id, std::vector<std::ifstream>& fi
 }
 }  // namespace
 
-bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& profile, uint64_t budget, int k, std::string& err) {
+uint64_t QwenExl3::blob_bytes(int layer) const {
+    const auto it = table_.layers.find(layer);
+    return it == table_.layers.end() ? 0 : it->second.blob();
+}
+
+bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& profile, uint64_t budget, int k, std::string& err,
+                            int lb, int le) {
     namespace x3k = strata::kernels::exl3;
     k_ = k;
     const int n_layers = table_.layers.empty() ? 0 : table_.layers.rbegin()->first + 1;
@@ -197,7 +203,7 @@ bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& prof
     bool room = true;
     for (const auto& p : profile)
         if (!(room = take(p.first, p.second))) break;
-    for (int l = 0; room && l < n_layers; ++l)
+    for (int l = lb; room && l < (le < 0 ? n_layers : le); ++l)
         for (int e = 0; room && e < n_expert_; ++e) room = take(l, e);
     // read a layer at a time on several threads, then one upload (the model's files are read once)
     const int n_threads = (int) std::clamp(std::thread::hardware_concurrency() / 2u, 2u, 16u);
