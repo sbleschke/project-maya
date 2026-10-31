@@ -318,7 +318,9 @@ def ngram_table(st: X.SafeTensors, d: pathlib.Path, t: dict) -> dict:
         if m:
             shards.append((int(m.group(1)), name))
     shards.sort()
-    if [s[0] for s in shards] != list(range(t["split_ngram_parts"])):
+    if not shards and base + "trellis" in header:              # (exllamav3 1.4's quants: one tensor, no shards)
+        shards = [(0, base + "trellis")]
+    elif [s[0] for s in shards] != list(range(t["split_ngram_parts"])):
         raise SystemExit("%s: %d shards, expected %d in a row" % (NGRAM_FILE, len(shards), t["split_ngram_parts"]))
     at, rows, words = None, 0, None
     for _, name in shards:
