@@ -5,6 +5,7 @@ table's checks.
 
     python -m unittest tools.test_qwen_exl3_pack -v
 """
+import importlib.util
 import json
 import pathlib
 import struct
@@ -17,9 +18,13 @@ import numpy as np
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE / "qwen"))
 import exl3_pack as X  # noqa: E402
-import pack as Q  # noqa: E402
+
+# by its path and under a name of its own: tools/ds4/pack.py is a `pack` too, and tests share a process under discover
+_spec = importlib.util.spec_from_file_location("qwen_pack", HERE / "qwen" / "pack.py")
+Q = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = Q
+_spec.loader.exec_module(Q)
 
 L = "model.language_model."
 HIDDEN, N_EXPERT, CONV = 256, 2, 4
