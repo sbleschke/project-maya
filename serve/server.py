@@ -4925,7 +4925,7 @@ def make_handler(svc: Service):
                 if svc.default_effort:   # (MiniMax's by its own five names, CYBER-FROST's by Qwen's three)
                     rec["reasoning_effort"] = (effort_name if getattr(svc.template, "minimax", False) else effort_level)(
                         svc.default_effort) or svc.default_effort
-                    if getattr(svc.template, "forced_thinking", False):
+                    if getattr(svc.template, "qwen_efforts", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
@@ -6004,7 +6004,7 @@ def main() -> int:
         level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
             (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
                                                      else "none")
-        if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
+        if getattr(svc.template, "qwen_efforts", False):   # (Qwen's words, low / medium / xhigh)
             level = QWEN_EFFORT.get(level, level)
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",

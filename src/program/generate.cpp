@@ -4868,13 +4868,19 @@ int main(int argc, char** argv) {
     strata::core::layer_set_shared_early(!o.shared_late);
     // An EXL3 pack of Qwen3.8-Flash-Next (tools/qwen/pack.py): its matrices as EXL3 on the GPU, its most-routed experts
     // in VRAM as far as they fit (--vram-reserve-mib leaves room; --expert-profile ranks them), the others on the CPU
-    // (QwenExl3).  So far: one GPU, the command line's one prompt (no --serve).
+    // (QwenExl3).  So far: one GPU.
     const bool qwen_exl3 = o.glm_pack.empty() && std::filesystem::exists(std::filesystem::path(o.pack) / "exl3.txt");
-    if (qwen_exl3 && (!o.native_preset.empty() || o.serve ||
+    if (qwen_exl3 && o.expert_cache < 0) o.expert_cache = 0;   // (--expert-cache auto: no cache to size)
+    if (qwen_exl3 && (!o.native_preset.empty() ||
                       o.expert_cache != 0 || !o.layer_split.empty() || o.vision)) {
-        std::fprintf(stderr, "maya generate: %s is an EXL3 pack: it takes no --native, --serve, "
+        std::fprintf(stderr, "maya generate: %s is an EXL3 pack: it takes no --native, "
                              "--expert-cache, --layer-split or --vision yet\n", o.pack.c_str());
         return 2;
+    }
+    // (--prefill auto: its buffers are its own, sized here, before the experts take what VRAM is left)
+    if (qwen_exl3 && o.prefill_auto) {
+        o.prefill_auto = false;
+        o.prefill_chunk = 2048;
     }
     if (!o.native_preset.empty() || qwen_exl3) {
         if (o.no_ple || o.ple_gguf.empty()) {
@@ -6880,6 +6886,7 @@ int main(int argc, char** argv) {
             }
         }
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+        if (qwen_exl3) sp.set_exl3(&qwen_x3);
         if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "maya serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
@@ -6909,6 +6916,7 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
+        if (qwen_exl3) vh.x3 = &qwen_x3;
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
@@ -7114,7 +7122,7 @@ int main(int argc, char** argv) {
         }
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
-        if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !qwen_exl3) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         cudaStream_t adapt_stream = nullptr;
         if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
             std::fprintf(stderr, "maya serve: cannot create the refill stream\n");
@@ -7339,27 +7347,28 @@ int main(int argc, char** argv) {
         {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
+            // (an EXL3 pack: its experts in VRAM, the others read from the model's files: no RAM tier)
+            const int64_t vram_slots = qwen_exl3 ? qwen_x3.resident() : xcache.slots();
+            const uint64_t vram_bytes = qwen_exl3 ? qwen_x3.expert_vram_bytes() : (uint64_t) xcache.bytes();
+            const uint64_t ram_bytes = qwen_exl3 ? 0 : from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total;
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
-                        (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
+                        (long long) vram_slots, (long long) (vram_bytes >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         // (the RAM the experts take: with them read from the GGUF, the RAM tier's - sized to fit)
-                        (long long) ((from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total)
-                                     >> 20), pool.workers(), o.pcie_frac,
+                        (long long) (ram_bytes >> 20), pool.workers(), o.pcie_frac,
                         o.spec_min_p);
             // (v1.1.32) the expert tiers, as the GLM engine's INFO names them: the Monitor's "where the experts live"
             const int64_t all_experts = (int64_t) g.n_layers * g.n_expert;
-            const int64_t ram_experts = from_gguf ? gguf_src.resident_blobs() : all_experts;
+            const int64_t ram_experts = qwen_exl3 ? 0 : from_gguf ? gguf_src.resident_blobs() : all_experts;
             std::printf("INFO engine_kind=qwen experts=%lld vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d"
                         " vision_lend=%llu\n",
-                        (long long) all_experts, (long long) xcache.slots(), (double) xcache.bytes() / 1073741824.0,
-                        (long long) ram_experts,
-                        (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
-                            1073741824.0,
+                        (long long) all_experts, (long long) vram_slots, (double) vram_bytes / 1073741824.0,
+                        (long long) ram_experts, (double) ram_bytes / 1073741824.0,
                         o.mtp.empty() ? 0 : 1, (unsigned long long) vis_cap);
         }
         start_serve_watchdog(60);   // one step (a prompt layer, a verify window) takes seconds
@@ -8069,8 +8078,10 @@ int main(int argc, char** argv) {
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t draft_offered = 0, draft_accepted = 0;
             // (the Monitor's "where the experts live": every routed expert in GB, and the RAM tier's share)
-            const double qwen_ram_gb = (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) / 1073741824.0;
-            const double qwen_all_gb = from_gguf ? (double) gguf_src.all_bytes() / 1073741824.0 : qwen_ram_gb;
+            // (an EXL3 pack has no RAM tier: its experts outside VRAM are read from the model's files)
+            const double qwen_ram_gb = qwen_exl3 ? 0.0 : (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) / 1073741824.0;
+            const double qwen_all_gb = qwen_exl3 ? (double) qwen_x3.expert_bytes() / 1073741824.0
+                                                 : from_gguf ? (double) gguf_src.all_bytes() / 1073741824.0 : qwen_ram_gb;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
@@ -8092,6 +8103,7 @@ int main(int argc, char** argv) {
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
+            const int64_t x3_vram0 = qwen_x3.routed_vram(), x3_disk0 = qwen_x3.routed_disk();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t staged0 = from_gguf ? gguf_src.staged() : 0;
             const Clock::time_point stat_t0 = Clock::now();
@@ -8202,21 +8214,25 @@ int main(int argc, char** argv) {
                     stat_next = produced_n + 8;
                     const double el = std::chrono::duration<double>(Clock::now() - stat_t0).count();
                     const double nt = (double) produced_n;
-                    const int64_t h = drive.d.cache_hits - decode_hits0;
-                    const int64_t look = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
-                    const int64_t staged = from_gguf ? gguf_src.staged() - staged0 : 0;
+                    const double qwen_vram_gb = (double) (qwen_exl3 ? qwen_x3.expert_vram_bytes() : (uint64_t) xcache.bytes()) / 1073741824.0;
+                    const int64_t h = qwen_exl3 ? qwen_x3.routed_vram() - x3_vram0 : drive.d.cache_hits - decode_hits0;
+                    const int64_t look = qwen_exl3 ? h + qwen_x3.routed_disk() - x3_disk0
+                                                   : drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
+                    // (an EXL3 pack's experts outside VRAM all come from the model's files)
+                    const int64_t staged = qwen_exl3 ? look - h : from_gguf ? gguf_src.staged() - staged0 : 0;
                     std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=0 "
                                 "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f "
                                 "disk_gb=%.1f draft_acc=%lld draft_off=%lld\n",
                                 nt / std::max(1e-9, el), 1000.0 * el / nt, (double) h / (double) std::max<int64_t>(1, look),
                                 (double) std::max<int64_t>(0, look - h - staged) / nt, (double) staged / nt,
-                                (long long) xcache.resident(), (long long) xcache.slots(),
-                                (long long) (from_gguf ? gguf_src.resident_blobs()
+                                (long long) (qwen_exl3 ? qwen_x3.resident() : xcache.resident()),
+                                (long long) (qwen_exl3 ? qwen_x3.resident() : xcache.slots()),
+                                (long long) (qwen_exl3 ? 0 : from_gguf ? gguf_src.resident_blobs()
                                                        : (int64_t) g.n_layers * g.n_expert - xcache.resident()),
-                                (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
+                                (double) (qwen_exl3 ? 0 : from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
                                     1073741824.0,
-                                (double) xcache.bytes() / 1073741824.0,
-                                std::max(0.0, qwen_all_gb - (double) xcache.bytes() / 1073741824.0 - qwen_ram_gb),
+                                qwen_vram_gb,
+                                std::max(0.0, qwen_all_gb - qwen_vram_gb - qwen_ram_gb),
                                 (long long) draft_accepted, (long long) draft_offered);
                 }
                 std::fflush(stdout);

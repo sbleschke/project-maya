@@ -233,6 +233,12 @@ def qwen_mtp(cfg: dict) -> Path | None:
     return None
 
 
+def qwen_is_exl3(cfg: dict) -> bool:
+    """A Qwen config on an EXL3 pack (tools/qwen/pack.py): its index names exl3.txt's matrices."""
+    pack = pack_of(cfg)
+    return pack is not None and (pack / "exl3.txt").is_file()
+
+
 def mm3_pack_has(cfg: dict, key: str) -> bool:
     """MiniMax's pack indexes `key` (mm3.txt: "dspark.num_hidden_layers" its drafter, "vision.hidden_size" its vision
     tower - maya.py's checks)."""
@@ -408,7 +414,9 @@ def apply(cfg: dict, settings: dict) -> dict:
         args = set_flag(args, "--vram-reserve-mib", reserve) if reserve is not None else \
             drop_flag(args, "--vram-reserve-mib")
         ec = _num(s, "expert_cache", 1, 1000000, "Expert cache")
-        args = set_flag(args, "--expert-cache", "auto" if ec is None else ec)
+        # (an EXL3 pack: its experts' VRAM is what the reserve leaves, no cache to size)
+        args = drop_flag(args, "--expert-cache") if qwen_is_exl3(cfg) else \
+            set_flag(args, "--expert-cache", "auto" if ec is None else ec)
         pf = _num(s, "prefill", 64, 65536, "Prompt chunk")
         args = set_flag(args, "--prefill", "auto" if pf is None else pf)
         kv = str(s.get("kv") or "fp16")

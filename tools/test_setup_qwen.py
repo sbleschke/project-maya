@@ -92,6 +92,27 @@ class Names(unittest.TestCase):
 
 
 class Setup(unittest.TestCase):
+    def test_exl3_names_and_manifest(self):
+        self.assertEqual(Q.resolve("qwen-exl3"), ("qwen", "exl3"))
+        self.assertEqual(Q.shown("qwen", "exl3", 106.4), "Qwen-3.8-Flash-Next · EXL3 3.18 bpw (106 GB)")
+        self.assertNotIn("CYBER-FROST", Q.shown("qwen", "exl3-own"))
+        self.assertEqual(Q.config_stem("qwen", "exl3"), "maya-qwen-exl3")
+        self.assertEqual(Q.config_stem("qwen", "q5_k_m"), "maya-cyber-frost")
+        m = maya.qwen_exl3_entry()
+        self.assertEqual(len(m["revision"]), 40)
+        for name, sha in m["sha256"].items():
+            self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
+        for name in ("config.json", "tokenizer.json", "chat_template.jinja", "ngram_embedding.safetensors"):
+            self.assertIn(name, m["files"])
+        for tool in maya.QWEN_EXL3_PACK_TOOLS:
+            self.assertTrue((ROOT / tool).is_file(), tool)
+
+    def test_exl3_folder_is_recognised(self):
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t) / "config.json").write_text(json.dumps(
+                {"model_type": "qwen4_exp", "quantization_config": {"quant_method": "exl3"}}))
+            self.assertEqual(maya.exl3_folder_family(t), "qwen")
+
     def test_manifest_pinned(self):
         m = maya.qwen_entry()
         self.assertEqual(m["repo"], "peasantsmith/CYBER-FROST-3.8-PS-GUFF")

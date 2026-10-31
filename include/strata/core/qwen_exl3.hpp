@@ -41,6 +41,15 @@ public:
     int64_t resident() const { return resident_; }
     int64_t experts() const { return (int64_t) table_.layers.size() * n_expert_; }
     uint64_t expert_vram_bytes() const { return expert_vram_; }
+    /// Every routed expert, in VRAM or not.
+    uint64_t expert_bytes() const {
+        uint64_t n = 0;
+        for (const auto& kv : table_.layers) n += kv.second.blob() * (uint64_t) n_expert_;
+        return n;
+    }
+    /// Routed experts since the start, for the Monitor: computed from VRAM, read from the model's files.
+    int64_t routed_vram() const { return routed_vram_; }
+    int64_t routed_disk() const { return routed_disk_; }
     /// The prompt path: starts[e] = the first row of expert e's rows, given how many each has (cnt) - the experts in VRAM
     /// first, in the order of their blobs, then the others by id.
     void row_starts(int layer, const int32_t* cnt, int32_t* starts) const;
@@ -69,6 +78,7 @@ private:
     std::vector<std::vector<uint8_t>> blobs_;         // [worker]
     int n_expert_ = 0, k_ = 0;
     int64_t resident_ = 0;
+    int64_t routed_vram_ = 0, routed_disk_ = 0;
     uint64_t expert_vram_ = 0;
     std::vector<unsigned long long> host_table_;      // [layer * n_expert + expert]: the blob in VRAM, 0: not there
     unsigned long long* d_table_ = nullptr;

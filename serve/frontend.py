@@ -61,6 +61,8 @@ class ChatTemplate:
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
         self.forced_thinking = bool(re.search(r"set\s+enable_thinking\s*=\s*true", self.source))
+        # a Qwen3.8 template's reasoning efforts are low, medium and xhigh (CYBER-FROST's and its base's)
+        self.qwen_efforts = self.forced_thinking or "Supported types are xhigh" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
