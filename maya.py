@@ -678,7 +678,7 @@ QWEN = "CYBER-FROST-3.8-PS"                        # (its id: the folder, the in
 QWEN_SHOWN = Q.SHOWN["qwen"]                       # (its name on screen: "Qwen-3.8-Flash-Next (CYBER-FROST)")
 QWEN_MANIFEST = ROOT / "tools" / "qwen" / "download.json"
 # Qwen3.8-Flash-Next itself in turboderp's EXL3 quant, or an EXL3 folder of your own (--model-dir), on the same path: its
-# matrices and its most-routed experts in VRAM, the others read from the model's files.  One GPU, NVIDIA, for now
+# matrices and its most-routed experts in VRAM, the others read from the model's files.  NVIDIA so far
 QWEN_EXL3 = "Qwen3.8-Flash-Next-EXL3-3.18bpw"
 QWEN_EXL3_MANIFEST = ROOT / "tools" / "qwen" / "exl3-3.18.json"
 QWEN_EXL3_PACK_TOOLS = ("tools/qwen/pack.py", "tools/exl3_pack.py", "tools/gguf_writer.py", "tools/strata_tokenizer.py",
@@ -6564,7 +6564,7 @@ def write_config_qwen_exl3(a, pc: dict, meta: dict, pack: Path, ctx: int, models
            "model_name": QWEN_EXL3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": folder_sampling(d, QWEN_SAMPLING) if own else dict(QWEN_SAMPLING), "reasoning_effort": QWEN_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
+    for k in ("host", "api_key", "cors_origins", "mcp_servers", "layer_split"):
         if old.get(k) is not None:
             cfg[k] = old[k]
             kept.append(k)
@@ -6590,7 +6590,7 @@ def write_config_qwen_exl3(a, pc: dict, meta: dict, pack: Path, ctx: int, models
 
 
 def set_up_qwen_exl3(a, prev: dict) -> Path | None:
-    """Qwen3.8-Flash-Next's EXL3 steps 1-8: the PC (one NVIDIA GPU so far), the context, the engine, the files (the pinned
+    """Qwen3.8-Flash-Next's EXL3 steps 1-8: the PC (NVIDIA; several GPUs: a layer split), the context, the engine, the files (the pinned
     download, or --model-dir: a folder of your own, at any bit rate), the pack and the drafter, the config."""
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
@@ -6600,10 +6600,6 @@ def set_up_qwen_exl3(a, prev: dict) -> Path | None:
     pc = check_pc(a, "qwen")                           # 1
     if pc.get("backend") == "hip":
         fail("the EXL3 quant runs on NVIDIA GPUs so far", f"on AMD: {ME} --model cyber-frost")
-    if len(pc["gpus"]) > 1:                            # (the Qwen path's EXL3 experts: one GPU so far)
-        best = max(pc["gpus"], key=lambda g: g["vram_gb"])
-        warn(f"the EXL3 quant runs on one GPU so far: it takes the largest, GPU {best['index']} ({best['vram_gb']:.0f} GB)")
-        pc = dict(pc, gpus=[best])
     vram = sum(g["vram_gb"] for g in pc["gpus"])
     if vram < m["memory_gb"]:
         warn(f"{vram:.0f} GB of VRAM: about {m['memory_gb']:.0f} GB of experts do not all fit, and the others are read from "

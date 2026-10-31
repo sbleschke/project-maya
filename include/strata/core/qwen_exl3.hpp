@@ -36,8 +36,12 @@ public:
     const void* mat(const std::string& name) const;
     size_t mat_count() const { return mats_.size(); }
     uint64_t vram_bytes() const { return vram_; }
-    /// The experts of `profile` (ranked pairs; then every other expert, layer by layer) into `budget` bytes of VRAM.
-    bool load_experts(const std::vector<std::pair<int32_t, int32_t>>& profile, uint64_t budget, int k, std::string& err);
+    /// The experts of `profile` (ranked pairs; then every other expert of the layers [lb, le), le < 0: to the last, layer
+    /// by layer) into `budget` bytes of VRAM.  A layer split: each GPU's object holds its own layers' experts.
+    bool load_experts(const std::vector<std::pair<int32_t, int32_t>>& profile, uint64_t budget, int k, std::string& err,
+                      int lb = 0, int le = -1);
+    /// One expert's bytes in `layer`.
+    uint64_t blob_bytes(int layer) const;
     int64_t resident() const { return resident_; }
     int64_t experts() const { return (int64_t) table_.layers.size() * n_expert_; }
     uint64_t expert_vram_bytes() const { return expert_vram_; }
