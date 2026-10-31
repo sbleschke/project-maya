@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <thread>
@@ -277,6 +278,17 @@ void QwenExl3::row_starts(int layer, const int32_t* cnt, int32_t* starts) const 
 bool QwenExl3::prompt_experts(int layer, const int32_t* cnt, const int32_t* starts, const float* x, const int32_t* row_tok,
                               uint16_t* h16, float* y, int64_t& n_resident, int64_t& n_streamed, void* stream,
                               std::string& err) {
+    // A test hook: STRATA_X3_PROMPT_FAIL=<n> makes the n-th call here fail, once, counted over all the GPUs of a layer
+    // split, so the engine's recovery can be checked (the request must end with an error and the engine must live).
+    static std::atomic<int64_t> fail_in = [] {
+        const char* v = std::getenv("STRATA_X3_PROMPT_FAIL");
+        return std::atomic<int64_t>(v ? std::atoll(v) : 0);
+    }();
+    if (fail_in.load() > 0 && fail_in.fetch_sub(1) == 1) {
+        std::fprintf(stderr, "maya exl3: layer %d's prompt experts cannot run (STRATA_X3_PROMPT_FAIL)\n", layer);
+        err = "EXL3 pack: the prompt's experts of layer " + std::to_string(layer) + " ran out of memory";
+        return false;
+    }
     namespace x3k = strata::kernels::exl3;
     const cudaStream_t cs = (cudaStream_t) stream;
     const Exl3Table::Layer& L = table_.layers.at(layer);

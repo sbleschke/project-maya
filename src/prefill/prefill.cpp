@@ -1013,6 +1013,9 @@ bool Prefill::drain_pipe(std::string& err) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    // An earlier request's failure must not outlive it: `on_chunk` takes a non-empty `err` for a failure of its own, and a
+    // later stage's `err` is its Impl's next_err, which stays between requests.
+    err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
