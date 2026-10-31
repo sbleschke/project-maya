@@ -71,8 +71,9 @@ class Names(unittest.TestCase):
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             maya.choose_family(a, {})
         (label, note, about) = rows[3]
-        self.assertEqual(label, "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M (113 GB)")
-        self.assertTrue(about.startswith("Qwen-3.8-Flash-Next (CYBER-FROST): 180B"), about)
+        self.assertEqual(label, "Qwen-3.8-Flash-Next")
+        self.assertIn("EXL3 quants at 3.18", about)
+        self.assertIn("Qwen-3.8-Flash-Next (CYBER-FROST)", about)
         self.assertNotIn("CYBER-FROST-3.8-PS", about)
         self.assertIn("UD-Q8_K_XL", rows[1][2])
         self.assertNotIn("UD-Q4_K_XL", rows[1][2])
@@ -98,14 +99,43 @@ class Setup(unittest.TestCase):
         self.assertNotIn("CYBER-FROST", Q.shown("qwen", "exl3-own"))
         self.assertEqual(Q.config_stem("qwen", "exl3"), "maya-qwen-exl3")
         self.assertEqual(Q.config_stem("qwen", "q5_k_m"), "maya-cyber-frost")
-        m = maya.qwen_exl3_entry()
-        self.assertEqual(len(m["revision"]), 40)
-        for name, sha in m["sha256"].items():
-            self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
-        for name in ("config.json", "tokenizer.json", "chat_template.jinja", "ngram_embedding.safetensors"):
-            self.assertIn(name, m["files"])
+        self.assertEqual(Q.resolve("qwen-exl3-4.18"), ("qwen", "exl3-4.18"))
+        self.assertEqual(Q.config_stem("qwen", "exl3-6.05"), "maya-qwen-exl3-6.05")
+        names = set()
+        for quant in maya.QWEN_EXL3_QUANTS:
+            m = maya.qwen_exl3_entry(quant)
+            names.add(m["name"])
+            self.assertEqual(len(m["revision"]), 40)
+            for name, sha in m["sha256"].items():
+                self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
+            for name in ("config.json", "tokenizer.json", "chat_template.jinja", "ngram_embedding.safetensors"):
+                self.assertIn(name, m["files"])
+        self.assertEqual(len(names), 3)
         for tool in maya.QWEN_EXL3_PACK_TOOLS:
             self.assertTrue((ROOT / tool).is_file(), tool)
+
+    def test_the_quant_picker(self):
+        """By VRAM: the largest checked EXL3 quant whose experts all fit, else CYBER-FROST's GGUF; the answer before is the
+        default; no question where the options already say."""
+        def asked(gpus, prev=None):
+            seen = {}
+
+            def pick(title, intro, rows, default, yes, *x):
+                seen["rows"], seen["default"] = rows, default
+                return default
+            a = type("A", (), {"model": None, "model_dir": None, "yes": True, "check": False})()
+            with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[{"vram_gb": v} for v in gpus]):
+                got = maya.choose_qwen_quant(a, prev or {})
+            return got, [r[1] for r in seen["rows"]][0], len(seen["rows"])
+        self.assertEqual(asked([48]), ("q5_k_m", "recommended", 4))
+        self.assertEqual(asked([48, 24]), ("exl3", "recommended", 4))
+        self.assertEqual(asked([48, 24, 24]), ("exl3-4.18", "recommended", 4))
+        self.assertEqual(asked([128]), ("exl3-4.18", "recommended", 4))   # (6.05: offered, not yet recommended)
+        self.assertEqual(asked([48, 24, 24], {"installer": {"qwen_quant": "exl3"}})[0], "exl3")
+        given = type("A", (), {"model": None, "model_dir": None, "qwen_quant": "exl3-6.05"})()
+        self.assertEqual(maya.choose_qwen_quant(given, {}), "exl3-6.05")
+        cf = type("A", (), {"model": maya.QWEN, "model_dir": None})()
+        self.assertEqual(maya.choose_qwen_quant(cf, {}), "q5_k_m")
 
     def test_exl3_folder_is_recognised(self):
         with tempfile.TemporaryDirectory() as t:

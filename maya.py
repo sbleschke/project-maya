@@ -679,8 +679,8 @@ QWEN_SHOWN = Q.SHOWN["qwen"]                       # (its name on screen: "Qwen-
 QWEN_MANIFEST = ROOT / "tools" / "qwen" / "download.json"
 # Qwen3.8-Flash-Next itself in turboderp's EXL3 quant, or an EXL3 folder of your own (--model-dir), on the same path: its
 # matrices and its most-routed experts in VRAM, the others read from the model's files.  NVIDIA so far
-QWEN_EXL3 = "Qwen3.8-Flash-Next-EXL3-3.18bpw"
-QWEN_EXL3_MANIFEST = ROOT / "tools" / "qwen" / "exl3-3.18.json"
+QWEN_EXL3 = "Qwen3.8-Flash-Next-EXL3-3.18bpw"     # (--model qwen-exl3's; --qwen-quant / the picker name the others)
+QWEN_EXL3_QUANTS = {"exl3": "3.18", "exl3-4.18": "4.18", "exl3-6.05": "6.05"}   # (their tools/qwen/exl3-<bits>.json)
 QWEN_EXL3_PACK_TOOLS = ("tools/qwen/pack.py", "tools/exl3_pack.py", "tools/gguf_writer.py", "tools/strata_tokenizer.py",
                         "tools/mtp_from_gguf.py", "tools/mtp_rt.py")
 QWEN_EXL3_MODEL_NAME = "qwen3.8-flash-next"
@@ -1680,6 +1680,8 @@ def choose_family(a, prev: dict) -> str:
     if a.model:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else \
             "qwen" if a.model in (QWEN, QWEN_EXL3) else "glm"
+    if getattr(a, "qwen_quant", None):
+        return "qwen"
     metal = getattr(a, "backend", None) == "metal"
     if a.gguf_dir or a.draft or (metal and not a.model_dir):     # (Metal runs GLM only: no question)
         return "glm"
@@ -1711,11 +1713,13 @@ def choose_family(a, prev: dict) -> str:
              "up to a 1M context" + ("; or Maya's own GGUF quants (MiniMax-M3.1-Flash-Maya-XS ~93 GB, -Maya-S ~122 "
                                      "GB: NVIDIA from V100 on and AMD)"
                                      if any(map(mm3_gguf_published, ("gguf-xs", "gguf-s"))) else "") + "."),
-            (Q.shown("qwen", "q5_k_m", qwen_entry()["download_gb"]), "new",
-             f"{QWEN_SHOWN}: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
-             "in peasantsmith's GGUF, on Maya's own Qwen path; NVIDIA from V100 on or AMD, Linux or Windows; all its "
-             f"experts in about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the others "
-             "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only.")]
+            (Q.QWEN_BASE_SHOWN, "new",
+             "Qwen3.8-Flash-Next (180B, 10 of 512 experts a token) on Maya's own Qwen path: turboderp's EXL3 quants at 3.18, "
+             "4.18 or 6.05 bits (NVIDIA, the layers split across your GPUs, fast when all its experts fit in VRAM), or "
+             f"{QWEN_SHOWN}, Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (NVIDIA from V100 on or AMD, "
+             f"Linux or Windows; about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the "
+             "others read from the SSD); tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; "
+             "text only.")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -2385,9 +2389,10 @@ def import_catalog(models: Path) -> list:
     q = tolerant(qwen_entry)
     if q:
         entry(QWEN, QWEN, q)
-    q = tolerant(qwen_exl3_entry)
-    if q:
-        entry(QWEN_EXL3, QWEN_EXL3, q)
+    for quant in QWEN_EXL3_QUANTS:
+        q = tolerant(qwen_exl3_entry, quant)
+        if q:
+            entry(q["name"], q["name"], q)
     return cat
 
 
@@ -6227,12 +6232,13 @@ def qwen_entry() -> dict:
             "memory_gb": float(man.get("memory_gb") or 84)}
 
 
-def qwen_exl3_entry() -> dict:
-    """Qwen3.8-Flash-Next's EXL3 download (tools/qwen/exl3-3.18.json) as a MODELS entry (offer_download's form)."""
-    man = read_json(QWEN_EXL3_MANIFEST)
+def qwen_exl3_entry(quant: str = "exl3") -> dict:
+    """A Qwen3.8-Flash-Next EXL3 download (tools/qwen/exl3-<bits>.json) as a MODELS entry (offer_download's form)."""
+    path = ROOT / "tools" / "qwen" / f"exl3-{QWEN_EXL3_QUANTS[quant]}.json"
+    man = read_json(path)
     if not man.get("files") or not man.get("revision"):
-        fail(f"{QWEN_EXL3_MANIFEST} is missing or damaged", "restore it (git checkout tools/qwen/exl3-3.18.json)")
-    return {"about": f"{Q.QWEN_BASE_SHOWN} in turboderp's EXL3 quant ({man.get('about', '3.18 bpw')}); "
+        fail(f"{path} is missing or damaged", f"restore it (git checkout tools/qwen/{path.name})")
+    return {"name": man["name"], "about": f"{Q.QWEN_BASE_SHOWN} in turboderp's EXL3 quant ({man.get('about', '3.18 bpw')}); "
                      f"{man.get('license', 'the Qwen Community License')}",
             "format": "qwen-exl3", "repo": man["repo"], "revision": man["revision"], "folder": "",
             "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
@@ -6543,13 +6549,16 @@ def qwen_exl3_pack_step(a, d: Path, files: list, llama: Path) -> Path:
     return pack
 
 
-def write_config_qwen_exl3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path, own: bool) -> Path:
-    """maya-qwen-exl3.json (a folder of your own: named after it) and its start script.  A setup again keeps what the
+def write_config_qwen_exl3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path, quant: str,
+                           name: str) -> Path:
+    """maya-qwen-exl3.json (the other quants': maya-qwen-exl3-4.18.json; a folder of your own: named after it) and its
+    start script.  A setup again keeps what the
     config before says that this one does not ask."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
+    own = quant == "exl3-own"
     stem = f"maya-{re.sub(r'[^a-z0-9._-]+', '-', d.name.lower()).strip('-') or 'qwen-own'}" if own else \
-        Q.config_stem("qwen", "exl3")
+        Q.config_stem("qwen", quant)
     cfg_path = ROOT / f"{stem}.json"
     old = read_json(cfg_path) if cfg_path.exists() else {}
     profile = pack / "expert-profile.bin"
@@ -6578,8 +6587,8 @@ def write_config_qwen_exl3(a, pc: dict, meta: dict, pack: Path, ctx: int, models
     if kept:
         ok("kept from the config before: " + ", ".join(kept))
     cfg["log"] = str(cfg_path.with_suffix(".log"))
-    cfg["installer"] = {"family": "qwen", "models_dir": str(models), "quant": QWEN_EXL3,
-                        "qwen_quant": "exl3-own" if own else "exl3", "model_dir": str(d),
+    cfg["installer"] = {"family": "qwen", "models_dir": str(models), "quant": name,
+                        "qwen_quant": quant, "model_dir": str(d),
                         **({"own": True} if own else {}), "written": time.strftime("%Y-%m-%d %H:%M")}
     if isinstance((old.get("installer") or {}).get("mtp_calibration"), dict):
         cfg["installer"]["mtp_calibration"] = old["installer"]["mtp_calibration"]
@@ -6589,23 +6598,71 @@ def write_config_qwen_exl3(a, pc: dict, meta: dict, pack: Path, ctx: int, models
     return cfg_path
 
 
-def set_up_qwen_exl3(a, prev: dict) -> Path | None:
+def qwen_exl3_fits(m: dict, gpus: list) -> bool:
+    """All of a quant's experts fit in VRAM: about 10 GB of each GPU go to its copy of the matrices, its session and its
+    buffers, and its memory_gb counts about 7 GB of matrices (measured: 3.18 bits on 48 + 24 GB, 4.18 on 48 + 24 + 24)."""
+    return m["memory_gb"] - 7 <= sum(g["vram_gb"] for g in gpus if g.get("vram_gb")) - 10 * len(gpus)
+
+
+def choose_qwen_quant(a, prev: dict) -> str:
+    """Qwen-3.8-Flash-Next's files: --qwen-quant or --model, else --model-dir's, else the ones set up before, else asked -
+    by this PC's VRAM the largest EXL3 quant checked against exllamav3 whose experts all fit (they lose most of their
+    speed when they do not), and on a PC with too little for any, or AMD, CYBER-FROST's GGUF."""
+    if getattr(a, "qwen_quant", None):
+        return a.qwen_quant
+    if a.model == QWEN:
+        return "q5_k_m"
+    if a.model_dir:
+        return "exl3-own" if exl3_folder_family(a.model_dir) == "qwen" else "q5_k_m"
+    if getattr(a, "backend", None) == "hip":
+        return "q5_k_m"
+    try:
+        gpus = S.gpus()
+    except Exception:  # noqa: BLE001 - no NVIDIA tools
+        gpus = []
+    entries = {k: qwen_exl3_entry(k) for k in QWEN_EXL3_QUANTS}
+    fit = [k for k, m in entries.items() if qwen_exl3_fits(m, gpus) and k != "exl3-6.05"]   # (never loaded in exllamav3 yet)
+    rec = max(fit, key=lambda k: entries[k]["memory_gb"]) if fit else "q5_k_m"
+    keys = list(entries) + ["q5_k_m"]
+    about = {k: f"the base model; its experts and matrices in about {m['memory_gb']:.0f} GB of VRAM, across your GPUs "
+                "(the more out of VRAM, the slower: they are read from the SSD); NVIDIA" for k, m in entries.items()}
+    about["exl3"] += "; 80 tokens a second measured on an RTX PRO 5000 + RTX 3090"
+    about["exl3-4.18"] += "; 77 tokens a second measured on an RTX PRO 5000 + 2x RTX 3090"
+    about["exl3-6.05"] += ("; 12 tokens a second measured on 96 GB of VRAM, which holds three quarters of it; not yet "
+                           "compared with exllamav3, which needs more VRAM than that")
+    q = qwen_entry()
+    about["q5_k_m"] = (f"Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF; its experts in about "
+                       f"{q['memory_gb']:.0f} GB of VRAM and RAM together; NVIDIA or AMD")
+    gb = {**{k: m["download_gb"] for k, m in entries.items()}, "q5_k_m": q["download_gb"]}
+    order = sorted(keys, key=lambda k: k != rec)
+    before = (prev.get("installer") or {}).get("qwen_quant")
+    default = before if before in order else rec
+    pick = choose(f"Which files of {Q.QWEN_BASE_SHOWN}?", ["The more bits an EXL3 quant keeps, the more VRAM its "
+                                                           "experts need; all of these run on Maya's own Qwen path:"],
+                  [(Q.shown("qwen", k, gb[k]), "recommended" if k == rec else None, about[k]) for k in order],
+                  order.index(default), a.yes or a.check)
+    return order[pick]
+
+
+def set_up_qwen_exl3(a, prev: dict, quant: str = "exl3") -> Path | None:
     """Qwen3.8-Flash-Next's EXL3 steps 1-8: the PC (NVIDIA; several GPUs: a layer split), the context, the engine, the files (the pinned
     download, or --model-dir: a folder of your own, at any bit rate), the pack and the drafter, the config."""
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     own = Path(a.model_dir).expanduser().resolve() if a.model_dir and exl3_folder_family(a.model_dir) == "qwen" else None
-    m = qwen_exl3_entry()
+    if own:
+        quant = "exl3-own"
+    m = qwen_exl3_entry("exl3" if own else quant)
     pc = check_pc(a, "qwen")                           # 1
     if pc.get("backend") == "hip":
         fail("the EXL3 quant runs on NVIDIA GPUs so far", f"on AMD: {ME} --model cyber-frost")
     vram = sum(g["vram_gb"] for g in pc["gpus"])
-    if vram < m["memory_gb"]:
-        warn(f"{vram:.0f} GB of VRAM: about {m['memory_gb']:.0f} GB of experts do not all fit, and the others are read from "
+    if not qwen_exl3_fits(m, pc["gpus"]):
+        warn(f"{vram:.0f} GB of VRAM: this quant's {m['memory_gb']:.0f} GB do not all fit, and the experts left out are read from "
              "the SSD whenever they are routed: with a third of them in VRAM, about 5 tokens a second")
     step(2, "your choices")                            # 2
-    ok(f"model: {Q.shown('qwen', 'exl3-own') if own else Q.shown('qwen', 'exl3', m['download_gb'])} "
+    ok(f"model: {Q.shown('qwen', 'exl3-own') if own else Q.shown('qwen', quant, m['download_gb'])} "
        "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
     rec = qwen_recommended_context(vram)
     ctx = choose_context(a, prev_ctx, QWEN_CONTEXTS, rec)
@@ -6613,7 +6670,7 @@ def set_up_qwen_exl3(a, prev: dict) -> Path | None:
        f"; its KV cache: {qwen_kv_gb(ctx):.1f} GB of VRAM")
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    d = own or models / QWEN_EXL3
+    d = own or models / m["name"]
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
@@ -6626,7 +6683,7 @@ def set_up_qwen_exl3(a, prev: dict) -> Path | None:
     else:
         names = [d / n for n in m["files"]]
         if any(file_incomplete(m, f) for f in names) and \
-                not offer_download(a, Q.shown("qwen", "exl3", m["download_gb"]), d, names, m):
+                not offer_download(a, Q.shown("qwen", quant, m["download_gb"]), d, names, m):
             return None
         for f in names:
             if not sha256_checked(f, m["sha256"][f.name]):
@@ -6639,7 +6696,7 @@ def set_up_qwen_exl3(a, prev: dict) -> Path | None:
     pack = qwen_exl3_pack_step(a, d, files, llama)     # 6
     step(7, "images")                                  # 7
     ok("pictures: none yet (text only)")
-    cfg_path = write_config_qwen_exl3(a, pc, meta, pack, ctx, models, d, own is not None)   # 8
+    cfg_path = write_config_qwen_exl3(a, pc, meta, pack, ctx, models, d, quant, d.name if own else m["name"])   # 8
     if "mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate:
         how = drafting_choice(a, "the MTP drafter", "5-10")
         if how != "measure":
@@ -6655,8 +6712,9 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     """CYBER-FROST-3.8-PS's steps 1-8: the PC (NVIDIA from V100, or AMD), the context (recommended by this PC's VRAM),
     the engine (build/maya), the file (pinned, sha256-checked), the pack and the MTP drafter, the config; then the
     drafter measured."""
-    if a.model == QWEN_EXL3 or (a.model_dir and exl3_folder_family(a.model_dir) == "qwen"):
-        return set_up_qwen_exl3(a, prev)
+    quant = choose_qwen_quant(a, prev)
+    if quant.startswith("exl3"):
+        return set_up_qwen_exl3(a, prev, quant)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -6725,13 +6783,15 @@ def model_option(a) -> str | None:
     hit = Q.resolve(a.model, list(MODELS))
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                f", {DS4}, {MM3}, cyber-frost = {QWEN_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+                f", {DS4}, {MM3}, cyber-frost = {QWEN_SHOWN}, qwen-exl3 (qwen-exl3-4.18, qwen-exl3-6.05) = "
+                f"{Q.QWEN_BASE_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
     family, key = hit
     if family == "glm":
         a.model = key
         return None
     if family == "qwen":                                 # (CYBER-FROST's GGUF, or the base model's EXL3 quant)
-        a.model = QWEN_EXL3 if key == "exl3" else QWEN
+        a.model = QWEN_EXL3 if str(key).startswith("exl3") else QWEN
+        a.qwen_quant = key
         return None
     a.model, flag = (DS4, "ds4_quant") if family == "deepseek" else (MM3, "mm3_quant")
     if key is not None:
@@ -6807,6 +6867,9 @@ def main() -> int:
                                        "or the .gguf file (the first one of a split model) when the folder holds "
                                        "several models; it must be writable - the pack is written inside it "
                                        "(without this option the setup lists the ones it finds in ~/models*)")
+    ap.add_argument("--qwen-quant", choices=(*QWEN_EXL3_QUANTS, "q5_k_m"),
+                    help="Qwen-3.8-Flash-Next's files: its EXL3 quants (exl3: 3.18 bits, exl3-4.18, exl3-6.05) or "
+                         "CYBER-FROST's GGUF (q5_k_m); default: asked, by this PC's VRAM the one recommended")
     ap.add_argument("--models-dir", help="where downloaded models go, each in a folder named after it, e.g. "
                                          "<DIR>/Maya-L/ (default: Maya-data/models next to this folder); use "
                                          "a fast NVMe SSD with ~100 GB free")

@@ -135,7 +135,7 @@ class Model:
         self.t[hf + ".svh"] = (r.standard_normal(n) * 0.1 + 1).astype("<f2")
         self.t[hf + ".mul1"] = np.array(0, dtype="<i4")
 
-    def ngram(self, d: pathlib.Path, gap: bool) -> None:
+    def ngram(self, d: pathlib.Path, gap: bool, one_tensor: bool = False) -> None:
         K, rows = 3, 128                                  # the heads cover 48: rounded up to a multiple of 128
         base = L + "layers.1.ple.ple_embedding.ngram_embedding."
         sizes = np.full(16, 3, dtype="<i8")
@@ -143,10 +143,13 @@ class Model:
              base + "head_offsets": (np.arange(16) * 3).astype("<i8"), base + "head_vocab_sizes": sizes,
              base + "layer_multipliers": np.array([1, 2, 3], dtype="<i8")}
         words = 1 + 10 * K
-        t[base + "shard_0.trellis"] = np.zeros((rows // 2, words), dtype="<i2")
-        if gap:
-            t[base + "other"] = np.zeros(4, dtype="<i2")
-        t[base + "shard_1.trellis"] = np.zeros((rows // 2, words), dtype="<i2")
+        if one_tensor:
+            t[base + "trellis"] = np.zeros((rows, words), dtype="<i2")
+        else:
+            t[base + "shard_0.trellis"] = np.zeros((rows // 2, words), dtype="<i2")
+            if gap:
+                t[base + "other"] = np.zeros(4, dtype="<i2")
+            t[base + "shard_1.trellis"] = np.zeros((rows // 2, words), dtype="<i2")
         write_st(d / Q.NGRAM_FILE, t, {"format": "exl3_ngram_trellis", "codebook": "mul1", "K": str(K),
                                        "row_dim": "160", "rows": str(rows)})
 
@@ -278,6 +281,17 @@ class TestQwenPack(unittest.TestCase):
 
 
 class TestRefusals(unittest.TestCase):
+    def test_a_table_of_one_tensor(self):
+        """exllamav3 1.4's quants (4.05 - 6.05 bpw): the whole table in one tensor."""
+        with tempfile.TemporaryDirectory() as t:
+            d = pathlib.Path(t)
+            m = Model(d)
+            m.ngram(d, False, one_tensor=True)
+            st = X.SafeTensors(d)
+            table = Q.ngram_table(st, d, TEXT)
+            self.assertEqual((table["K"], table["rows"], table["row_bytes"]), (3, 128, 62))
+            del st
+
     def test_shards_not_one_run_of_rows(self):
         with tempfile.TemporaryDirectory() as t:
             d = pathlib.Path(t)

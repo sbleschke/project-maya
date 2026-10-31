@@ -1,0 +1,120 @@
+{
+ "_": "Qwen3.8-Flash-Next in turboderp's EXL3 quant at 6.05 bits a weight (the shared matrices K 8, the head K 6, the n-gram table K 6). The `maya` engine reads it in place through tools/qwen/pack.py's pack.",
+ "name": "Qwen3.8-Flash-Next-EXL3-6.05bpw",
+ "repo": "turboderp/Qwen3.8-Flash-Next-exl3",
+ "revision": "d2e238feca4c1c4d966943117356d8a42c2f4dcb",
+ "branch": "6.05bpw_h6_ng6",
+ "license": "Qwen Community License 1.0 (LICENSE.qwen-community-1.0)",
+ "about": "EXL3 6.05 bpw, 10 of 512 experts a token",
+ "memory_gb": 100,
+ "files": {
+  ".chat_template.jinja.kate-swp": [
+   187,
+   "60c0d2504ed2f7e155bd7c4ba6921251eb0e6e7c0c35eb2e5b996c62c88cdfde"
+  ],
+  "chat_template.jinja": [
+   8952,
+   "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+  ],
+  "config.json": [
+   5081,
+   "882d1afff53de14dbd6ac847c72dc05cdbe7a3ead52fb99bf8d5d160e8f88662"
+  ],
+  "generation_config.json": [
+   202,
+   "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+  ],
+  "merges.txt": [
+   3353259,
+   "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+  ],
+  "model-00001-of-00013.safetensors": [
+   7308213247,
+   "f30a0770fa06b06b61d8bbef452e658f6a2854e8b58d162ec6d76a4923c68584"
+  ],
+  "model-00002-of-00013.safetensors": [
+   7954303863,
+   "161909d9c76106abf8e3a6c1d59e5582c74520abab7b639a60f0d525834c9b8e"
+  ],
+  "model-00003-of-00013.safetensors": [
+   7954310047,
+   "ad6a0185bc3c084ee1385aecad8b15e946fb7bf1d90618d855d30b8d8e5682dd"
+  ],
+  "model-00004-of-00013.safetensors": [
+   7954328605,
+   "f9f51e33835368ea441ec3eee8dbc3293a1859daca8b1564052e5f7bc705ad83"
+  ],
+  "model-00005-of-00013.safetensors": [
+   7954328605,
+   "d80e6a09becea0897041d06a82bbbe73e1db8cb9eccf84e27e8e955356fcc290"
+  ],
+  "model-00006-of-00013.safetensors": [
+   7954328605,
+   "85f3c35195d97efd2af0e6df2bd4a5a344185af07385121a2c692f602f2c683b"
+  ],
+  "model-00007-of-00013.safetensors": [
+   7954328605,
+   "69447c625d149a3e37c230c901e4ca97c8df34b065e921f8eca99a6e02e312b1"
+  ],
+  "model-00008-of-00013.safetensors": [
+   7954328605,
+   "538e75dc6f7b355bca98c14ce5e7b403dfaf171ffa68cb9220e9353f06e4682c"
+  ],
+  "model-00009-of-00013.safetensors": [
+   7954328605,
+   "35a704135bea5d8da507c62e3e9c8c1cf1ac0321ede923f731bf2e37b102b8ec"
+  ],
+  "model-00010-of-00013.safetensors": [
+   7954328605,
+   "69960fd415ff25125cd68c83227c67079381e9bb415ce03470eaf6e621f29a6e"
+  ],
+  "model-00011-of-00013.safetensors": [
+   7954328605,
+   "e0b8bad9dc90aeca918a14245e30fe630a8748b0b39b4a437a3380c470836470"
+  ],
+  "model-00012-of-00013.safetensors": [
+   7954328605,
+   "35d8eef6d89daf6db3a5bdce239c79dbd56f814696af80529d1180c88b1d1dda"
+  ],
+  "model-00013-of-00013.safetensors": [
+   5029558997,
+   "aca66c97b8f489c3037d0b7c771e63e1386f5d2498e1e9a4fa6374abee94f297"
+  ],
+  "model.safetensors.index.json": [
+   32762977,
+   "01223becbd7fb5355274b848af46d78108c01c66b5bfcf91df312949b1b3ada1"
+  ],
+  "mtp_hyper_connection_mixer_patch.safetensors": [
+   13128048,
+   "9b29ae89413854802076ad392809abe4d91a1e61a6bc08193dad8271a7510953"
+  ],
+  "ngram_embedding.safetensors": [
+   39040193720,
+   "c63613666649014e668cdbd32a4e3f1e8beda697eb4f3a1874300d93a1bfbc75"
+  ],
+  "preprocessor_config.json": [
+   390,
+   "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+  ],
+  "quantization_config.json": [
+   96676747,
+   "0f1ee6d44064d7f27c8c1a1cf67bf02e70492f662ee43dbd17c74f20d7264123"
+  ],
+  "tokenizer.json": [
+   12809320,
+   "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+  ],
+  "tokenizer_config.json": [
+   17928,
+   "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+  ],
+  "video_preprocessor_config.json": [
+   385,
+   "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+  ],
+  "vocab.json": [
+   6722759,
+   "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+  ]
+ }
+}
