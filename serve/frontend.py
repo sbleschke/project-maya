@@ -79,6 +79,8 @@ class ChatTemplate:
         # gets the nearest level it knows.  Every other model renders exactly as before.
         self.glm_dsa = bool(glm_dsa)
         self.dialect = effort_dialect(self.source)
+        # a Qwen3.8 template's reasoning efforts are low, medium and xhigh (CYBER-FROST's and its base's)
+        self.qwen_efforts = self.forced_thinking or "Supported types are xhigh" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:

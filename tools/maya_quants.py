@@ -191,13 +191,17 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("deepseek", "abliterated-128g"): "orcarouter Abliterated Mix-128G",
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
-          ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS"}   # (the base model in unsloth's GGUF: maya.QWEN_UD)
+          ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS",   # (the base model in unsloth's GGUF: maya.QWEN_UD)
+          ("qwen", "exl3"): "EXL3 3.18 bpw", ("qwen", "exl3-own"): "your EXL3 folder"}
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"
 SHOWN_KEY = {("qwen", "ud-iq2_xs"): "Qwen-3.8-Flash-Next"}
 # CYBER-FROST-3.8-PS: its one GGUF (peasantsmith/CYBER-FROST-3.8-PS-GUFF) - the setup ids it is asked for by
 QWEN_IDS = ("cyber-frost", "cyber-frost-3.8", "cyber-frost-3.8-ps", "cyber-frost-3.8-ps-q5_k_m", "cyber-frost-q5_k_m")
 # unsloth's UD-IQ2_XS of Qwen3.8-Flash-Next: the setup ids it is asked for by (the first: the Models page's)
 QWEN_UD_IDS = ("qwen-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2_xs", "qwen3.8-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2-xs")
+# Qwen3.8-Flash-Next itself in turboderp's EXL3 quant: the base model, so no "CYBER-FROST" in its name on screen
+QWEN_EXL3_IDS = ("qwen-exl3", "qwen3.8-exl3", "qwen3.8-flash-next-exl3")
+QWEN_BASE_SHOWN = "Qwen-3.8-Flash-Next"
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
 MM3_QUANT_ALIASES = {"maya-xs": "gguf-xs", "maya-s": "gguf-s"}
 
@@ -221,7 +225,8 @@ def full_name(family: str, key: str | None) -> str | None:
 def shown(family: str, key: str | None = None, gb: float | None = None) -> str:
     """The files as users see them, the model's name first: "MiniMax M3.1 · Maya-XS", with gb "... (93 GB)"; never a
     bare tier.  Files that are not a Maya quant by their own name ("DeepSeek V4.1 · UD-Q8_K_XL"); no key: the model."""
-    name = SHOWN_KEY.get((family, key)) or SHOWN.get(family, family)
+    name = QWEN_BASE_SHOWN if family == "qwen" and str(key).startswith("exl3") else \
+        SHOWN_KEY.get((family, key)) or SHOWN.get(family, family)
     what = tier(family, key) or OTHERS.get((family, key)) or key
     return (name + SEP + what if what else name) + (f" ({gb:.0f} GB)" if gb else "")
 
@@ -231,7 +236,8 @@ def config_stem(family: str, key: str | None) -> str | None:
     always had (GLM's maya-<download>.json, DeepSeek's maya-ds4.json, MiniMax's EXL3 maya-mm3.json - installs and
     their run scripts point at them).  MiniMax's GGUFs, new with the scheme, are the first named by it."""
     if family == "qwen":
-        return "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
+        return "maya-qwen-exl3" if str(key).startswith("exl3") else \
+            "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
     return f"maya-{setup_id(family, key)}" if family == "minimax" and setup_id(family, key) else None
 
 
@@ -252,6 +258,8 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "qwen", "q5_k_m"
     if low in QWEN_UD_IDS:
         return "qwen", "ud-iq2_xs"
+    if low in QWEN_EXL3_IDS:
+        return "qwen", "exl3"
     for f in ("deepseek", "minimax", "qwen"):
         if low == MODEL[f].lower():
             return f, None
