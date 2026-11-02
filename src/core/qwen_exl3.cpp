@@ -1,10 +1,16 @@
 // src/core/qwen_exl3.cpp - see include/strata/core/qwen_exl3.hpp.
 #include "strata/core/qwen_exl3.hpp"
+#include "strata/core/expert_source.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -13,12 +19,30 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <new>
 #include <thread>
+
+#include "glm_fast_state.hpp"
 
 namespace strata::core {
 
 namespace x3 = strata::kernels::exl3;
 namespace xc = strata::kernels::cpu;
+
+namespace {
+constexpr size_t kRamAlign = 2u << 20;   // (a huge page; a blob's pieces, multiples of 256 bytes, keep their alignment)
+// The CPU's experts: one pool for every GPU's object (a layer split runs its layers in turn).  It lives as long as the
+// process; its workers spin 2 ms for the next batch, longer than a layer takes, because a futex wake a batch - four a
+// layer - would cost more than a band.  Made by start_workers, at the start: physical_cores() keeps to the calling
+// thread's CPUs, and the host loop's thread is pinned to one, where it would find no core for a worker.
+glmfast::Workers& cpu_workers() {
+    static glmfast::Workers* w = [] {
+        const std::vector<int> cores = xc::physical_cores(true);
+        return new glmfast::Workers((int) cores.size(), 2000, cores);
+    }();
+    return *w;
+}
+}  // namespace
 
 namespace {
 // `bytes` from a file into a new device allocation.
@@ -46,6 +70,7 @@ QwenExl3::~QwenExl3() {
     if (d_plan_) cudaFree(d_plan_);
     if (d_bounds_) cudaFree(d_bounds_);
     if (d_stage_) cudaFree(d_stage_);
+    if (ram_) ::operator delete(ram_, std::align_val_t(kRamAlign));
 }
 
 bool QwenExl3::served_names(const std::string& pack_dir, std::set<std::string>& out, std::string& err) {
@@ -165,7 +190,9 @@ bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& prof
                             int lb, int le) {
     namespace x3k = strata::kernels::exl3;
     k_ = k;
+    lb_ = lb;
     const int n_layers = table_.layers.empty() ? 0 : table_.layers.rbegin()->first + 1;
+    le_ = le < 0 ? n_layers : le;
     host_table_.assign((size_t) n_layers * n_expert_, 0ull);
     lay_.assign((size_t) n_layers, x3k::ExpertLayout{});
     for (const auto& kv : table_.layers) {
@@ -262,6 +289,76 @@ bool QwenExl3::load_experts(const std::vector<std::pair<int32_t, int32_t>>& prof
     return true;
 }
 
+int QwenExl3::start_workers() { return cpu_workers().size(); }
+
+void QwenExl3::load_ram(const std::vector<std::pair<int32_t, int32_t>>& profile) {
+    host_ram_.assign(host_table_.size(), nullptr);
+    // what this PC's RAM holds, less a headroom; MAYA_EXPERT_RAM_GB caps all the GPUs' objects together
+    static uint64_t taken = 0;
+    uint64_t room = expert_ram_room(nullptr, nullptr, false);
+    if (const char* v = std::getenv("MAYA_EXPERT_RAM_GB")) {
+        const double gb = std::atof(v);
+        if (gb >= 0.0) {
+            const uint64_t cap = (uint64_t) (gb * 1073741824.0);
+            room = std::min(room, cap > taken ? cap - taken : 0);
+        }
+    }
+    // which ones: those not in VRAM, the profile's ranking, then the rest of this object's layers
+    struct Pick { int l, e; uint64_t at; };
+    std::vector<Pick> picks;
+    std::vector<char> seen(host_table_.size(), 0);
+    uint64_t want = 0;
+    const auto take = [&](int l, int e) {
+        const auto it = table_.layers.find(l);
+        if (l < lb_ || l >= le_ || e < 0 || e >= n_expert_ || it == table_.layers.end()) return true;
+        const size_t i = (size_t) l * n_expert_ + e;
+        if (seen[i] || host_table_[i] != 0ull) return true;
+        if (want + it->second.blob() > room) return false;
+        seen[i] = 1;
+        picks.push_back({l, e, want});
+        want += it->second.blob();
+        return true;
+    };
+    bool fits = true;
+    for (const auto& p : profile)
+        if (!(fits = take(p.first, p.second))) break;
+    for (int l = lb_; fits && l < le_; ++l)
+        for (int e = 0; fits && e < n_expert_; ++e) fits = take(l, e);
+    if (picks.empty()) return;
+    ram_ = (uint8_t*) ::operator new(want, std::align_val_t(kRamAlign), std::nothrow);
+    if (ram_ == nullptr) {
+        std::fprintf(stderr, "maya generate: no %.1f GiB of RAM for the experts: they are read from the model's files\n",
+                     (double) want / 1073741824.0);
+        return;
+    }
+#if defined(__linux__)
+    madvise(ram_, want, MADV_HUGEPAGE);
+#endif
+    const int n_threads = (int) std::clamp(std::thread::hardware_concurrency() / 2u, 2u, 16u);
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < n_threads; ++t)
+        workers.emplace_back([&] {
+            std::vector<std::ifstream> files;
+            for (const std::string& name : table_.files)
+                files.emplace_back((std::filesystem::path(dir_) / name).string(), std::ios::binary);
+            for (size_t i; !failed && (i = next.fetch_add(1)) < picks.size();)
+                if (!read_blob(table_.layers.at(picks[i].l), picks[i].e, files, ram_ + picks[i].at)) failed = true;
+        });
+    for (std::thread& w : workers) w.join();
+    if (failed) {
+        std::fprintf(stderr, "maya generate: a read of the experts into RAM failed: they are read from the model's files\n");
+        ::operator delete(ram_, std::align_val_t(kRamAlign));
+        ram_ = nullptr;
+        return;
+    }
+    for (const Pick& p : picks) host_ram_[(size_t) p.l * n_expert_ + p.e] = ram_ + p.at;
+    ram_resident_ = (int64_t) picks.size();
+    ram_bytes_ = want;
+    taken += want;
+}
+
 void QwenExl3::row_starts(int layer, const int32_t* cnt, int32_t* starts) const {
     int32_t at = 0;
     for (int e : slots_[(size_t) layer]) {
@@ -345,12 +442,12 @@ bool QwenExl3::prompt_experts(int layer, const int32_t* cnt, const int32_t* star
     for (size_t j0 = 0; j0 < miss.size(); j0 += kStage) {
         const int m = (int) std::min(miss.size() - j0, (size_t) kStage);
         std::atomic<bool> failed{false};
-        std::vector<std::thread> workers;
-        for (int i = 0; i < m; ++i)
-            workers.emplace_back([&, i] {
-                if (!read_blob(L, miss[j0 + i], stage_files_[(size_t) i], host_stage_.data() + (size_t) i * blob)) failed = true;
-            });
-        for (std::thread& w : workers) w.join();
+        cpu_workers().run(m, [&](int i) {
+            uint8_t* to = host_stage_.data() + (size_t) i * blob;
+            const uint8_t* ram = host_ram_.empty() ? nullptr : host_ram_[(size_t) layer * n_expert_ + miss[j0 + (size_t) i]];
+            if (ram != nullptr) std::memcpy(to, ram, blob);
+            else if (!read_blob(L, miss[j0 + (size_t) i], stage_files_[(size_t) i], to)) failed = true;
+        });
         if (failed) {
             err = "EXL3 pack: a read of layer " + std::to_string(layer) + "'s experts failed";
             return false;
@@ -405,76 +502,105 @@ bool QwenExl3::layer_hits(int layer, const int32_t* ids, const float* weights, c
     return true;
 }
 
-void QwenExl3::expert(int worker, int layer, int id, const float* x, float* out) {
+void QwenExl3::experts_run(int layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t n_embd, int64_t k, float* out) {
     const Exl3Table::Layer& L = table_.layers.at(layer);
-    auto& files = files_[(size_t) worker];
-    auto& blob = blobs_[(size_t) worker];
-    const auto align64 = [](uint8_t* p) { return (uint8_t*) (((uintptr_t) p + 63) & ~(uintptr_t) 63); };
-    // the expert's three parts, each piece on a 64-byte boundary (the files keep them on none)
-    uint64_t need = 0;
-    for (int r = 0; r < 3; ++r) need += L.part(r) + 3 * 64;
-    const int n_ff = L.n[0], n_embd = L.k[0];
-    const uint64_t floats = 4 * (uint64_t) n_embd + 2 * (uint64_t) n_ff + 128;   // xh of each, gate, up
-    blob.resize(need + floats * sizeof(float) + 64);
-    uint8_t* at = align64(blob.data());
-    xc::Exl3Part part[3];
-    for (int r = 0; r < 3; ++r) {
-        const uint64_t bytes[3] = {(uint64_t) L.k[r] * L.n[r] * L.k2[r] / 16, 2 * (uint64_t) L.k[r], 2 * (uint64_t) L.n[r]};
-        uint8_t* piece[3];
-        for (int j = 0; j < 3; ++j) {
-            const size_t ix = (size_t) id * 9 + (size_t) r * 3 + (size_t) j;
-            std::ifstream& f = files[(size_t) L.file[ix]];
-            f.seekg((std::streamoff) L.off[ix]);
-            f.read((char*) at, (std::streamsize) bytes[j]);
-            if (!f) {
-                f.clear();
-                std::memset(at, 0, bytes[j]);
-                std::fprintf(stderr, "maya generate: layer %d expert %d: a read of the model's files failed\n", layer, id);
-            }
-            piece[j] = at;
-            at = align64(at + bytes[j]);
-        }
-        part[r].trellis = (const uint32_t*) piece[0];
-        part[r].suh = (const uint16_t*) piece[1];
-        part[r].svh = (const uint16_t*) piece[2];
-        part[r].k = L.k[r];
-        part[r].n = L.n[r];
-        part[r].k2 = L.k2[r];
-    }
-    float* xh = (float*) at;
-    float* g = xh + n_embd;
-    float* u = g + n_ff;
-    const auto run = [&](const xc::Exl3Part& m, const float* in, float* y) {
-        const float sum = xc::exl3_cpu_prepare(m, in, xh);
-        for (int c = 0; c < m.n; c += 128) xc::exl3_cpu_band(m, xh, sum, c, y + c);
+    const strata::kernels::exl3::ExpertLayout& lay = lay_[(size_t) layer];
+    const int n_ff = L.n[0];
+    const int ff_bands = n_ff / 128, embd_bands = (int) n_embd / 128;
+    struct Miss {
+        const float* x;
+        float* out;
+        int id;
+        const uint8_t* blob;
+        xc::Exl3Part part[3];
+        float* xh[3];
+        float sum[3];
+        float* g;
+        float* u;
     };
-    run(part[0], x, g);
-    run(part[1], x, u);
-    for (int i = 0; i < n_ff; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];   // silu(gate) * up
-    run(part[2], g, out);
-}
-
-void QwenExl3::experts_run(int layer, const float* x, const int32_t* ids, int64_t n_embd, int64_t k, float* out) {
-    if (files_.size() < (size_t) k) {
-        const size_t had = files_.size();
-        files_.resize((size_t) k);
-        blobs_.resize((size_t) k);
-        for (size_t w = had; w < (size_t) k; ++w)
-            for (const std::string& name : table_.files)
-                files_[w].emplace_back((std::filesystem::path(dir_) / name).string(), std::ios::binary);
-    }
-    std::vector<std::thread> workers;
-    workers.reserve((size_t) k);
-    for (int64_t i = 0; i < k; ++i) {
-        if (!host_table_.empty() && host_table_[(size_t) layer * n_expert_ + ids[i]] != 0ull) {
-            std::memset(out + i * n_embd, 0, (size_t) n_embd * sizeof(float));   // (layer_hits has it)
-            ++routed_vram_;
-            continue;
+    std::vector<Miss> miss;
+    miss.reserve((size_t) (n_tok * k));
+    for (int64_t t = 0; t < n_tok; ++t)
+        for (int64_t i = 0; i < k; ++i) {
+            const int id = ids[t * k + i];
+            float* o = out + (t * k + i) * n_embd;
+            const size_t at = (size_t) layer * n_expert_ + id;
+            if (!host_table_.empty() && host_table_[at] != 0ull) {
+                std::memset(o, 0, (size_t) n_embd * sizeof(float));   // (layer_hits has it)
+                ++routed_vram_;
+                continue;
+            }
+            const uint8_t* ram = host_ram_.empty() ? nullptr : host_ram_[at];
+            ++(ram != nullptr ? routed_ram_ : routed_disk_);
+            miss.push_back(Miss{x + t * n_embd, o, id, ram, {}, {}, {}, nullptr, nullptr});
         }
-        ++routed_disk_;
-        workers.emplace_back([=, this] { expert((int) i, layer, ids[i], x, out + i * n_embd); });
+    const int m = (int) miss.size();
+    if (m == 0) return;
+    // each one's scratch, on 64-byte boundaries; and, for one not in RAM, its bytes and the files to read them with
+    const size_t floats = (size_t) (2 * n_embd + 3 * n_ff), each = floats * sizeof(float);
+    work_.resize((size_t) m * each + 64);
+    float* scratch = (float*) (((uintptr_t) work_.data() + 63) & ~(uintptr_t) 63);
+    for (int i = 0; i < m; ++i) {
+        Miss& w = miss[(size_t) i];
+        float* f = scratch + (size_t) i * floats;
+        w.xh[0] = f;
+        w.xh[1] = f + n_embd;
+        w.xh[2] = f + 2 * n_embd;
+        w.g = w.xh[2] + n_ff;
+        w.u = w.g + n_ff;
+        if (w.blob == nullptr && files_.size() <= (size_t) i) {
+            files_.resize((size_t) i + 1);
+            blobs_.resize((size_t) i + 1);
+        }
+        if (w.blob == nullptr && files_[(size_t) i].empty())
+            for (const std::string& name : table_.files)
+                files_[(size_t) i].emplace_back((std::filesystem::path(dir_) / name).string(), std::ios::binary);
     }
-    for (std::thread& t : workers) t.join();
+    const uint64_t blob_bytes = L.blob();
+    glmfast::Workers& pool = cpu_workers();
+    const auto band = [&](Miss& w, int r, int b, float* y) {
+        xc::exl3_cpu_band(w.part[r], w.xh[r], w.sum[r], b * 128, y + (size_t) b * 128);
+    };
+    // the inputs (and an expert not in RAM read)
+    pool.run(m, [&](int i) {
+        Miss& w = miss[(size_t) i];
+        if (w.blob == nullptr) {
+            std::vector<uint8_t>& buf = blobs_[(size_t) i];
+            buf.resize((size_t) blob_bytes + 64);
+            uint8_t* at = (uint8_t*) (((uintptr_t) buf.data() + 63) & ~(uintptr_t) 63);
+            if (!read_blob(L, w.id, files_[(size_t) i], at)) {
+                std::memset(at, 0, (size_t) blob_bytes);
+                std::fprintf(stderr, "maya generate: layer %d expert %d: a read of the model's files failed\n", layer, w.id);
+            }
+            w.blob = at;
+        }
+        for (int r = 0; r < 3; ++r) {
+            w.part[r].trellis = (const uint32_t*) (w.blob + lay.trellis[r]);
+            w.part[r].suh = (const uint16_t*) (w.blob + lay.suh[r]);
+            w.part[r].svh = (const uint16_t*) (w.blob + lay.svh[r]);
+            w.part[r].k = L.k[r];
+            w.part[r].n = L.n[r];
+            w.part[r].k2 = L.k2[r];
+        }
+        w.sum[0] = xc::exl3_cpu_prepare(w.part[0], w.x, w.xh[0]);
+        w.sum[1] = xc::exl3_cpu_prepare(w.part[1], w.x, w.xh[1]);
+    });
+    // gate and up, a band a job
+    pool.run(m * 2 * ff_bands, [&](int j) {
+        Miss& w = miss[(size_t) (j / (2 * ff_bands))];
+        const int r = (j / ff_bands) & 1;
+        band(w, r, j % ff_bands, r == 0 ? w.g : w.u);
+    });
+    // silu(gate) * up, the down's input
+    pool.run(m, [&](int i) {
+        Miss& w = miss[(size_t) i];
+        for (int c = 0; c < n_ff; ++c) w.g[c] = w.g[c] / (1.0f + std::exp(-w.g[c])) * w.u[c];
+        w.sum[2] = xc::exl3_cpu_prepare(w.part[2], w.g, w.xh[2]);
+    });
+    pool.run(m * embd_bands, [&](int j) {
+        Miss& w = miss[(size_t) (j / embd_bands)];
+        band(w, 2, j % embd_bands, w.out);
+    });
 }
 
 }  // namespace strata::core

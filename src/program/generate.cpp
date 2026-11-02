@@ -606,7 +606,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
                 float* out) {
     Drive* t = (Drive*) user;
     const Clock::time_point a = Clock::now();
-    if (t->exl3 != nullptr) t->exl3->experts_run((int) t->d.layers++, x_f, ids, n_embd, k, out);
+    if (t->exl3 != nullptr) t->exl3->experts_run((int) t->d.layers++, x_f, ids, 1, n_embd, k, out);
     else strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
@@ -640,9 +640,7 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
-    if (t->exl3 != nullptr)
-        for (int64_t i = 0; i < n_tok; ++i)
-            t->exl3->experts_run((int) layer, x_f + i * n_embd_of_window, ids + i * k, n_embd_of_window, k, out + i * k * n_embd_of_window);
+    if (t->exl3 != nullptr) t->exl3->experts_run((int) layer, x_f, ids, n_tok, n_embd_of_window, k, out);
     else
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
@@ -5784,6 +5782,7 @@ int main(int argc, char** argv) {
         srcp = &arena_src;
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    if (qwen_exl3) std::fprintf(stderr, "maya generate: EXL3 experts off the GPU: %d CPU threads\n", strata::core::QwenExl3::start_workers());
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
@@ -6978,9 +6977,20 @@ int main(int argc, char** argv) {
                                  "(%.2f GiB)\n", st->dev, (long long) st->lb, (long long) (st->le - 1),
                          (long long) st->x3.resident(), (double) st->x3.expert_vram_bytes() / 1073741824.0);
         }
-        std::fprintf(stderr, "maya generate: EXL3 experts: %lld of %lld in VRAM (%.2f GiB, %.0f s), the others on the CPU\n",
-                     (long long) qwen_x3.resident(), (long long) qwen_x3.experts(),
-                     (double) qwen_x3.expert_vram_bytes() / 1073741824.0,
+        qwen_x3.load_ram(profile);
+        for (auto& st : stages) st->x3.load_ram(st->profile);
+        int64_t x3_vram_n = qwen_x3.resident(), x3_ram_n = qwen_x3.ram_resident();
+        uint64_t x3_vram_b = qwen_x3.expert_vram_bytes(), x3_ram_b = qwen_x3.ram_bytes();
+        for (const auto& st : stages) {
+            x3_vram_n += st->x3.resident();
+            x3_ram_n += st->x3.ram_resident();
+            x3_vram_b += st->x3.expert_vram_bytes();
+            x3_ram_b += st->x3.ram_bytes();
+        }
+        std::fprintf(stderr, "maya generate: EXL3 experts: %lld of %lld in VRAM (%.2f GiB), %lld in RAM (%.2f GiB), %lld read "
+                             "from the model's files when routed (%.0f s)\n",
+                     (long long) x3_vram_n, (long long) qwen_x3.experts(), (double) x3_vram_b / 1073741824.0,
+                     (long long) x3_ram_n, (double) x3_ram_b / 1073741824.0, (long long) (qwen_x3.experts() - x3_vram_n - x3_ram_n),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         thits.x3 = &qwen_x3;
     }
@@ -6993,7 +7003,10 @@ int main(int argc, char** argv) {
     const auto x3_resident = [&] { return x3_sum([](const strata::core::QwenExl3& x) { return x.resident(); }); };
     const auto x3_expert_bytes = [&] { return (uint64_t) x3_sum([](const strata::core::QwenExl3& x) { return x.expert_vram_bytes(); }); };
     const auto x3_routed_vram = [&] { return x3_sum([](const strata::core::QwenExl3& x) { return x.routed_vram(); }); };
+    const auto x3_routed_ram = [&] { return x3_sum([](const strata::core::QwenExl3& x) { return x.routed_ram(); }); };
     const auto x3_routed_disk = [&] { return x3_sum([](const strata::core::QwenExl3& x) { return x.routed_disk(); }); };
+    const auto x3_ram_resident = [&] { return x3_sum([](const strata::core::QwenExl3& x) { return x.ram_resident(); }); };
+    const auto x3_ram_bytes = [&] { return (uint64_t) x3_sum([](const strata::core::QwenExl3& x) { return x.ram_bytes(); }); };
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
@@ -7668,10 +7681,10 @@ int main(int argc, char** argv) {
         {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
-            // (an EXL3 pack: its experts in VRAM, the others read from the model's files: no RAM tier)
+            // (an EXL3 pack: its experts in VRAM, the next in RAM, the others read from the model's files)
             const int64_t vram_slots = qwen_exl3 ? x3_resident() : xcache.slots();
             const uint64_t vram_bytes = qwen_exl3 ? x3_expert_bytes() : (uint64_t) xcache.bytes();
-            const uint64_t ram_bytes = qwen_exl3 ? 0 : from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total;
+            const uint64_t ram_bytes = qwen_exl3 ? x3_ram_bytes() : from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total;
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f engine=" STRATA_VERSION "\n",
@@ -7685,7 +7698,7 @@ int main(int argc, char** argv) {
                         o.spec_min_p);
             // (v1.1.32) the expert tiers, as the GLM engine's INFO names them: the Monitor's "where the experts live"
             const int64_t all_experts = (int64_t) g.n_layers * g.n_expert;
-            const int64_t ram_experts = qwen_exl3 ? 0 : from_gguf ? gguf_src.resident_blobs() : all_experts;
+            const int64_t ram_experts = qwen_exl3 ? x3_ram_resident() : from_gguf ? gguf_src.resident_blobs() : all_experts;
             std::printf("INFO engine_kind=qwen experts=%lld vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d"
                         " vision_lend=%llu\n",
                         (long long) all_experts, (long long) vram_slots, (double) vram_bytes / 1073741824.0,
@@ -8418,8 +8431,7 @@ int main(int argc, char** argv) {
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t draft_offered = 0, draft_accepted = 0;
             // (the Monitor's "where the experts live": every routed expert in GB, and the RAM tier's share)
-            // (an EXL3 pack has no RAM tier: its experts outside VRAM are read from the model's files)
-            const double qwen_ram_gb = qwen_exl3 ? 0.0 : (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) / 1073741824.0;
+            const double qwen_ram_gb = qwen_exl3 ? (double) x3_ram_bytes() / 1073741824.0 : (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) / 1073741824.0;
             const double qwen_all_gb = qwen_exl3 ? (double) qwen_x3.expert_bytes() / 1073741824.0
                                                  : from_gguf ? (double) gguf_src.all_bytes() / 1073741824.0 : qwen_ram_gb;
             // what the session holds once this request is done: the prompt read so far, then every committed token
@@ -8443,7 +8455,7 @@ int main(int argc, char** argv) {
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
-            const int64_t x3_vram0 = x3_routed_vram(), x3_disk0 = x3_routed_disk();
+            const int64_t x3_vram0 = x3_routed_vram(), x3_ram0 = x3_routed_ram(), x3_disk0 = x3_routed_disk();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t staged0 = from_gguf ? gguf_src.staged() : 0;
             const Clock::time_point stat_t0 = Clock::now();
@@ -8572,10 +8584,9 @@ int main(int argc, char** argv) {
                     const double nt = (double) produced_n;
                     const double qwen_vram_gb = (double) (qwen_exl3 ? x3_expert_bytes() : (uint64_t) xcache.bytes()) / 1073741824.0;
                     const int64_t h = qwen_exl3 ? x3_routed_vram() - x3_vram0 : drive.d.cache_hits - decode_hits0;
-                    const int64_t look = qwen_exl3 ? h + x3_routed_disk() - x3_disk0
+                    const int64_t look = qwen_exl3 ? h + x3_routed_ram() - x3_ram0 + x3_routed_disk() - x3_disk0
                                                    : drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
-                    // (an EXL3 pack's experts outside VRAM all come from the model's files)
-                    const int64_t staged = qwen_exl3 ? look - h : from_gguf ? gguf_src.staged() - staged0 : 0;
+                    const int64_t staged = qwen_exl3 ? x3_routed_disk() - x3_disk0 : from_gguf ? gguf_src.staged() - staged0 : 0;
                     std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=0 "
                                 "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f "
                                 "disk_gb=%.1f draft_acc=%lld draft_off=%lld\n",
@@ -8583,9 +8594,9 @@ int main(int argc, char** argv) {
                                 (double) std::max<int64_t>(0, look - h - staged) / nt, (double) staged / nt,
                                 (long long) (qwen_exl3 ? x3_resident() : xcache.resident()),
                                 (long long) (qwen_exl3 ? x3_resident() : xcache.slots()),
-                                (long long) (qwen_exl3 ? 0 : from_gguf ? gguf_src.resident_blobs()
+                                (long long) (qwen_exl3 ? x3_ram_resident() : from_gguf ? gguf_src.resident_blobs()
                                                        : (int64_t) g.n_layers * g.n_expert - xcache.resident()),
-                                (double) (qwen_exl3 ? 0 : from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
+                                (double) (qwen_exl3 ? x3_ram_bytes() : from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
                                     1073741824.0,
                                 qwen_vram_gb,
                                 std::max(0.0, qwen_all_gb - qwen_vram_gb - qwen_ram_gb),
