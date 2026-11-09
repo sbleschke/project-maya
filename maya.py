@@ -7210,9 +7210,9 @@ def choose_qwen_quant(a, prev: dict) -> str:
     speed when they do not), and on a PC with too little for any, or AMD, CYBER-FROST's GGUF."""
     if getattr(a, "qwen_quant", None):
         return a.qwen_quant
-    if a.model == QWEN:
+    if getattr(a, "model", None) == QWEN:
         return "q5_k_m"
-    if a.model_dir:
+    if getattr(a, "model_dir", None):
         return "exl3-own" if exl3_folder_family(a.model_dir) == "qwen" else "q5_k_m"
     if getattr(a, "backend", None) == "hip":
         return "q5_k_m"
@@ -7243,7 +7243,7 @@ def choose_qwen_quant(a, prev: dict) -> str:
     pick = choose(f"Which files of {Q.QWEN_BASE_SHOWN}?", ["The more bits an EXL3 quant keeps, the more VRAM its "
                                                            "experts need; all of these run on Maya's own Qwen path:"],
                   [(Q.shown("qwen", k, gb[k]), "recommended" if k == rec else None, about[k]) for k in order],
-                  order.index(default), a.yes or a.check)
+                  order.index(default), getattr(a, "yes", False) or getattr(a, "check", False))
     return order[pick]
 
 

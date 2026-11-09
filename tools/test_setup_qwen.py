@@ -128,10 +128,10 @@ class Setup(unittest.TestCase):
             with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[{"vram_gb": v} for v in gpus]):
                 got = maya.choose_qwen_quant(a, prev or {})
             return got, [r[1] for r in seen["rows"]][0], len(seen["rows"])
-        self.assertEqual(asked([48]), ("q5_k_m", "recommended", 4))
-        self.assertEqual(asked([48, 24]), ("exl3", "recommended", 4))
-        self.assertEqual(asked([48, 24, 24]), ("exl3-4.18", "recommended", 4))
-        self.assertEqual(asked([128]), ("exl3-4.18", "recommended", 4))   # (6.05: offered, not yet recommended)
+        self.assertEqual(asked([48]), ("q5_k_m", "recommended", 5))
+        self.assertEqual(asked([48, 24]), ("exl3", "recommended", 5))
+        self.assertEqual(asked([48, 24, 24]), ("exl3-4.18", "recommended", 5))
+        self.assertEqual(asked([128]), ("exl3-4.18", "recommended", 5))   # (6.05: offered, not yet recommended)
         self.assertEqual(asked([48, 24, 24], {"installer": {"qwen_quant": "exl3"}})[0], "exl3")
         given = type("A", (), {"model": None, "model_dir": None, "qwen_quant": "exl3-6.05"})()
         self.assertEqual(maya.choose_qwen_quant(given, {}), "exl3-6.05")
@@ -429,7 +429,8 @@ class UnslothUD(unittest.TestCase):
 
     def test_choose_quant(self):
         a = type("A", (), {"qwen_quant": None, "yes": True})()
-        with patch.object(maya, "choose", lambda t, i, rows, default, yes: default):
+        with patch.object(maya, "choose", lambda t, i, rows, default, yes: default), \
+                patch.object(maya.S, "gpus", return_value=[]):   # (no EXL3 quant fits: the GGUF recommended)
             self.assertEqual(maya.choose_qwen_quant(a, {}), "q5_k_m")
             self.assertEqual(maya.choose_qwen_quant(a, {"installer": {"qwen_quant": UD}}), UD)
         a.qwen_quant = UD
