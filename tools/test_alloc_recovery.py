@@ -216,12 +216,12 @@ class AllocRecovery(unittest.TestCase):
         self.assertTrue(self.answer, "the plain engine gave no answer to compare with")
         for call in (1, QWEN_EXL3_EXPERT_LAYERS):
             with self.subTest(call=call):
-                e = self.engine({"STRATA_X3_PROMPT_FAIL": str(call)})
+                e = self.engine({"MAYA_X3_PROMPT_FAIL": str(call)})
                 try:
                     out = e.gen(self.ids, 8)
                     self.assertTrue(any(line.startswith("ERR") for line in out),
                                     f"the request should have failed with an error, not an answer: {out}")
-                    self.assertIn("STRATA_X3_PROMPT_FAIL", e.log_text(), "the hook did not fire")
+                    self.assertIn("MAYA_X3_PROMPT_FAIL", e.log_text(), "the hook did not fire")
                     self.assertTrue(e.alive(), "the engine died: the failure must not end the process")
                     out2 = e.gen(self.ids, 8)
                     self.assertTrue(any(line.startswith("DONE") for line in out2), f"the engine did not answer: {out2}")

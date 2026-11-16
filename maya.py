@@ -11425,7 +11425,7 @@ def qwen_exl3_pack_step(a, d: Path, files: list, llama: Path) -> Path:
     say("  Writing the index, the small float weights (about 7 GB beside the model) and the tokenizer; the "
         "experts and the n-gram table stay in the model's files ...")
     run([sys.executable, str(ROOT / "tools" / "qwen" / "pack.py"), "--model", str(d)],
-        env=dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py")))
+        env=dict(os.environ, MAYA_GGUF_PY=str(llama / "gguf-py")))
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
