@@ -5695,12 +5695,22 @@ int main(int argc, char** argv) {
             return 1;
         }
         void* sbuf_s = nullptr;
-        if (cudaMalloc(&sbuf_s, maya::core::session_bytes(g, o.max_context, K)) != cudaSuccess ||
-            maya::core::session_init(g, o.max_context, K, sbuf_s, st.ss) == 0 ||
-            cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaStreamCreateWithFlags(&st.adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaEventCreateWithFlags(&st.adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
-            std::fprintf(stderr, "maya generate: layer split, CUDA%d: the session state failed\n", st.dev);
+        const size_t sbytes_s = maya::core::session_bytes(g, o.max_context, K);
+        const char* sstep = nullptr;
+        cudaError_t serr = cudaSuccess;
+        if ((serr = cudaMalloc(&sbuf_s, sbytes_s)) != cudaSuccess) sstep = "cudaMalloc of the session buffer";
+        else if (maya::core::session_init(g, o.max_context, K, sbuf_s, st.ss) == 0) {
+            sstep = "session_init";
+            serr = cudaGetLastError();
+        } else if ((serr = cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking)) != cudaSuccess)
+            sstep = "the stream";
+        else if ((serr = cudaStreamCreateWithFlags(&st.adapt_stream, cudaStreamNonBlocking)) != cudaSuccess)
+            sstep = "the adapt stream";
+        else if ((serr = cudaEventCreateWithFlags(&st.adapt_ev, cudaEventDisableTiming)) != cudaSuccess)
+            sstep = "the adapt event";
+        if (sstep != nullptr) {
+            std::fprintf(stderr, "maya generate: layer split, CUDA%d: the session state failed (%s, %.2f GiB: %s)\n",
+                         st.dev, sstep, sbytes_s / 1073741824.0, cudaGetErrorString(serr));
             return 1;
         }
         const maya::core::WeightRef* wo_s = st.wt.find("output.weight");
